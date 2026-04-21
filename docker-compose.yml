@@ -1,0 +1,10 @@
+services:
+  bot:
+    build: .
+    container_name: expense-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Подкладываем credentials снаружи, чтобы не тащить их в образ
+      - ./credentials.json:/app/credentials.json:ro
