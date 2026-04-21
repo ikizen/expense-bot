@@ -22,12 +22,18 @@ SCOPES = [
 
 class SheetsClient:
     def __init__(self, creds_path: str, spreadsheet_id: str, sheet_name: str):
-        if not os.path.exists(creds_path):
+        creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+        if creds_json:
+            import json
+            info = json.loads(creds_json)
+            creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+        elif os.path.exists(creds_path):
+            creds = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
+        else:
             raise FileNotFoundError(
                 f"credentials.json не найден по пути {creds_path}. "
                 "Скачай его из Google Cloud Console → Service Accounts."
             )
-        creds = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
         self.client = gspread.authorize(creds)
         self.spreadsheet_id = spreadsheet_id
         self.sheet_name = sheet_name
