@@ -103,3 +103,4 @@ class SheetsClient:
 
         ws.update_cells(cell_updates, value_input_option="USER_ENTERED")
         return next_row
+
