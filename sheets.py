@@ -3,6 +3,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any
@@ -24,7 +25,6 @@ class SheetsClient:
     def __init__(self, creds_path: str, spreadsheet_id: str, sheet_name: str):
         creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
         if creds_json:
-            import json
             info = json.loads(creds_json)
             creds = Credentials.from_service_account_info(info, scopes=SCOPES)
         elif os.path.exists(creds_path):
@@ -52,7 +52,6 @@ class SheetsClient:
         return self._worksheet
 
     def ensure_headers(self) -> None:
-        """Ставит заголовки, если первая строка пустая."""
         ws = self.worksheet
         first_row = ws.row_values(1)
         if not first_row:
@@ -60,10 +59,47 @@ class SheetsClient:
             ws.format("A1:Z1", {"textFormat": {"bold": True}})
             log.info("Заголовки записаны.")
 
-    def append_row(self, row: list[Any]) -> int:
-        """Добавляет строку в конец листа. Возвращает номер новой строки."""
+    def _get_or_create_col(self, ws: gspread.Worksheet, headers: list[str], name: str) -> int:
+        """Возвращает 1-based индекс колонки, создаёт если не существует."""
+        if name in headers:
+            return headers.index(name) + 1
+        new_col = len(headers) + 1
+        ws.update_cell(1, new_col, name)
+        ws.format(
+            gspread.utils.rowcol_to_a1(1, new_col),
+            {"textFormat": {"bold": True}},
+        )
+        headers.append(name)
+        log.info("Добавлена новая колонка: %s", name)
+        return new_col
+
+    def append_row(self, row: list[Any], extra_expenses: list[dict] | None = None) -> int:
+        """Добавляет строку. extra_expenses динамически создаёт колонки при необходимости."""
         self.ensure_headers()
         ws = self.worksheet
-        ws.append_row(row, value_input_option="USER_ENTERED")
-        # gspread не возвращает номер строки — берём текущую длину.
-        return len(ws.get_all_values())
+        headers = ws.row_values(1)
+
+        if not extra_expenses:
+            ws.append_row(row, value_input_option="USER_ENTERED")
+            return len(ws.get_all_values())
+
+        # Нужны динамические колонки — пишем по ячейкам
+        all_values = ws.get_all_values()
+        next_row = len(all_values) + 1
+
+        # Стандартные поля
+        cell_updates = []
+        for col_idx, value in enumerate(row, start=1):
+            cell_updates.append(gspread.Cell(next_row, col_idx, value))
+
+        # Дополнительные расходы
+        for item in extra_expenses:
+            name = item.get("name", "").strip()
+            amount = item.get("amount", 0)
+            if not name:
+                continue
+            col_idx = self._get_or_create_col(ws, headers, name)
+            cell_updates.append(gspread.Cell(next_row, col_idx, amount))
+
+        ws.update_cells(cell_updates, value_input_option="USER_ENTERED")
+        return next_row
