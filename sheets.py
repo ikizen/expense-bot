@@ -39,25 +39,27 @@ class SheetsClient:
         self.sheet_name = sheet_name
         self._worksheet: gspread.Worksheet | None = None
 
+    def _get_worksheet(self, sheet_name: str) -> gspread.Worksheet:
+        sh = self.client.open_by_key(self.spreadsheet_id)
+        try:
+            return sh.worksheet(sheet_name)
+        except gspread.WorksheetNotFound:
+            log.info("Лист '%s' не найден — создаю.", sheet_name)
+            return sh.add_worksheet(title=sheet_name, rows=1000, cols=max(20, len(HEADERS)))
+
     @property
     def worksheet(self) -> gspread.Worksheet:
         if self._worksheet is None:
-            sh = self.client.open_by_key(self.spreadsheet_id)
-            try:
-                ws = sh.worksheet(self.sheet_name)
-            except gspread.WorksheetNotFound:
-                log.info("Лист '%s' не найден — создаю.", self.sheet_name)
-                ws = sh.add_worksheet(title=self.sheet_name, rows=1000, cols=max(20, len(HEADERS)))
-            self._worksheet = ws
+            self._worksheet = self._get_worksheet(self.sheet_name)
         return self._worksheet
 
-    def ensure_headers(self) -> None:
-        ws = self.worksheet
+    def ensure_headers(self, sheet_name: str | None = None) -> None:
+        ws = self._get_worksheet(sheet_name or self.sheet_name)
         first_row = ws.row_values(1)
         if not first_row:
             ws.update("A1", [HEADERS])
             ws.format("A1:Z1", {"textFormat": {"bold": True}})
-            log.info("Заголовки записаны.")
+            log.info("Заголовки записаны на листе '%s'.", sheet_name or self.sheet_name)
 
     def _get_or_create_col(self, ws: gspread.Worksheet, headers: list[str], name: str) -> int:
         """Возвращает 1-based индекс колонки, создаёт если не существует."""
@@ -73,10 +75,11 @@ class SheetsClient:
         log.info("Добавлена новая колонка: %s", name)
         return new_col
 
-    def append_row(self, row: list[Any], extra_expenses: list[dict] | None = None) -> int:
+    def append_row(self, row: list[Any], extra_expenses: list[dict] | None = None, sheet_name: str | None = None) -> int:
         """Добавляет строку. extra_expenses динамически создаёт колонки при необходимости."""
-        self.ensure_headers()
-        ws = self.worksheet
+        target = sheet_name or self.sheet_name
+        self.ensure_headers(target)
+        ws = self._get_worksheet(target)
         headers = ws.row_values(1)
 
         if not extra_expenses:

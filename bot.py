@@ -117,6 +117,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not re.search(r"отчет", text, re.IGNORECASE):
         return
 
+    # Определяем целевой лист по ключевым словам
+    sheet_name = context.bot_data["sheets"].sheet_name
+    for keyword, target_sheet in context.bot_data["sheet_routes"].items():
+        if re.search(keyword, text, re.IGNORECASE):
+            sheet_name = target_sheet
+            break
+
     parser: ExpenseParser = context.bot_data["parser"]
     status_msg = await update.message.reply_text("Разбираю…")
     try:
@@ -127,10 +134,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     token = uuid.uuid4().hex[:12]
-    PENDING[token] = parsed
+    PENDING[token] = {"data": parsed, "sheet": sheet_name}
 
+    sheet_label = f" → *{sheet_name}*" if sheet_name != context.bot_data["sheets"].sheet_name else ""
     await status_msg.edit_text(
-        f"Проверь данные:\n\n{format_preview(parsed)}",
+        f"Проверь данные{sheet_label}:\n\n{format_preview(parsed)}",
         reply_markup=_make_keyboard(token),
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -147,18 +155,19 @@ async def _handle_edit_correction(
         return
 
     parser: ExpenseParser = context.bot_data["parser"]
-    original = PENDING[token]
+    entry = PENDING[token]
+    original = entry["data"]
 
     status_msg = await update.message.reply_text("Применяю поправку…")
     try:
         merged = await asyncio.to_thread(parser.parse_correction, original, correction_text)
     except Exception as e:
         log.exception("correction parse failed")
-        EDIT_WAITING[user_id] = token  # вернуть в режим ожидания
+        EDIT_WAITING[user_id] = token
         await status_msg.edit_text(f"Ошибка: {html.escape(str(e))}. Попробуй ещё раз.")
         return
 
-    PENDING[token] = merged
+    PENDING[token] = {"data": merged, "sheet": entry["sheet"]}
     await status_msg.edit_text(
         f"Обновлено. Проверь:\n\n{format_preview(merged)}",
         reply_markup=_make_keyboard(token),
@@ -178,17 +187,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         user_id = query.from_user.id
         EDIT_WAITING[user_id] = token
+        parsed = PENDING[token]["data"]
         await query.edit_message_text(
             f"Что исправить? Напиши поправку — например:\n"
             f"<i>Каспи на самом деле 200к, кассир Асель</i>\n\n"
-            f"Текущие данные:\n\n{format_preview(PENDING[token])}",
+            f"Текущие данные:\n\n{format_preview(parsed)}",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    parsed = PENDING.pop(token, None)
+    entry = PENDING.pop(token, None)
 
-    if parsed is None:
+    if entry is None:
         await query.edit_message_text("Сессия истекла. Пришли отчёт заново.")
         return
 
@@ -199,13 +209,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if action != "ok":
         return
 
+    parsed = entry["data"]
+    sheet_name = entry["sheet"]
     sheets: SheetsClient = context.bot_data["sheets"]
     parser: ExpenseParser = context.bot_data["parser"]
     row = parser.row_for_sheet(parsed)
     extra = parsed.get("extra_expenses", [])
 
     try:
-        row_num = await asyncio.to_thread(sheets.append_row, row, extra)
+        row_num = await asyncio.to_thread(sheets.append_row, row, extra, sheet_name)
     except Exception as e:
         log.exception("sheets append failed")
         await query.edit_message_text(
@@ -214,7 +226,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     await query.edit_message_text(
-        f"Записал в строку {row_num}. ✅\n\n{format_preview(parsed)}",
+        f"Записал в строку {row_num} → *{sheet_name}*. ✅\n\n{format_preview(parsed)}",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -240,9 +252,16 @@ def build_app() -> Application:
     sheets.ensure_headers()
 
     app = Application.builder().token(tg_token).build()
+    # Маршруты: ключевая фраза (regex) → название листа
+    # Более специфичные фразы должны идти ПЕРВЫМИ
+    sheet_routes = {
+        r"отчет\s+финансы": "Финансы",
+    }
+
     app.bot_data["parser"] = parser
     app.bot_data["sheets"] = sheets
     app.bot_data["allowed_users"] = allowed_users
+    app.bot_data["sheet_routes"] = sheet_routes
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
