@@ -1,17 +1,19 @@
 """
-Клиент для записи отчётов в Google Sheets через service account.
+Клиент для работы с Google Sheets.
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
-from typing import Any
+from datetime import date, timedelta
+from typing import Any, TYPE_CHECKING
 
 import gspread
 from google.oauth2.service_account import Credentials
 
-from parser import HEADERS
+if TYPE_CHECKING:
+    from config_manager import ConfigManager
 
 log = logging.getLogger(__name__)
 
@@ -21,89 +23,144 @@ SCOPES = [
 ]
 
 
+def _build_gs_client(creds_path: str) -> gspread.Client:
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    if creds_json:
+        info = json.loads(creds_json)
+        creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+    elif os.path.exists(creds_path):
+        creds = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
+    else:
+        raise FileNotFoundError(
+            f"credentials.json не найден: {creds_path}. "
+            "Задай GOOGLE_CREDENTIALS_JSON или положи файл рядом с bot.py."
+        )
+    return gspread.authorize(creds)
+
+
 class SheetsClient:
-    def __init__(self, creds_path: str, spreadsheet_id: str, sheet_name: str):
-        creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-        if creds_json:
-            info = json.loads(creds_json)
-            creds = Credentials.from_service_account_info(info, scopes=SCOPES)
-        elif os.path.exists(creds_path):
-            creds = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
-        else:
-            raise FileNotFoundError(
-                f"credentials.json не найден по пути {creds_path}. "
-                "Скачай его из Google Cloud Console → Service Accounts."
-            )
-        self.client = gspread.authorize(creds)
+    def __init__(self, creds_path: str, spreadsheet_id: str,
+                 sheet_name: str, config: "ConfigManager"):
+        self.client = _build_gs_client(creds_path)
         self.spreadsheet_id = spreadsheet_id
         self.sheet_name = sheet_name
-        self._worksheet: gspread.Worksheet | None = None
+        self.config = config
+        self._ws_cache: dict[str, gspread.Worksheet] = {}
 
-    def _get_worksheet(self, sheet_name: str) -> gspread.Worksheet:
-        sh = self.client.open_by_key(self.spreadsheet_id)
-        try:
-            return sh.worksheet(sheet_name)
-        except gspread.WorksheetNotFound:
-            log.info("Лист '%s' не найден — создаю.", sheet_name)
-            return sh.add_worksheet(title=sheet_name, rows=1000, cols=max(20, len(HEADERS)))
-
-    @property
-    def worksheet(self) -> gspread.Worksheet:
-        if self._worksheet is None:
-            self._worksheet = self._get_worksheet(self.sheet_name)
-        return self._worksheet
+    def _get_ws(self, sheet_name: str) -> gspread.Worksheet:
+        if sheet_name not in self._ws_cache:
+            sh = self.client.open_by_key(self.spreadsheet_id)
+            try:
+                ws = sh.worksheet(sheet_name)
+            except gspread.WorksheetNotFound:
+                log.info("Лист '%s' не найден — создаю.", sheet_name)
+                ws = sh.add_worksheet(title=sheet_name, rows=1000, cols=30)
+            self._ws_cache[sheet_name] = ws
+        return self._ws_cache[sheet_name]
 
     def ensure_headers(self, sheet_name: str | None = None) -> None:
-        ws = self._get_worksheet(sheet_name or self.sheet_name)
-        first_row = ws.row_values(1)
-        if not first_row:
-            ws.update("A1", [HEADERS])
+        name = sheet_name or self.sheet_name
+        ws = self._get_ws(name)
+        if not ws.row_values(1):
+            ws.update("A1", [self.config.headers])
             ws.format("A1:Z1", {"textFormat": {"bold": True}})
-            log.info("Заголовки записаны на листе '%s'.", sheet_name or self.sheet_name)
+            log.info("Заголовки записаны на листе '%s'.", name)
 
-    def _get_or_create_col(self, ws: gspread.Worksheet, headers: list[str], name: str) -> int:
-        """Возвращает 1-based индекс колонки, создаёт если не существует."""
+    def create_sheet(self, sheet_name: str) -> bool:
+        """Создаёт новый лист. False если уже существует."""
+        sh = self.client.open_by_key(self.spreadsheet_id)
+        try:
+            sh.worksheet(sheet_name)
+            return False
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(title=sheet_name, rows=1000, cols=30)
+            ws.update("A1", [self.config.headers])
+            ws.format("A1:Z1", {"textFormat": {"bold": True}})
+            self._ws_cache[sheet_name] = ws
+            return True
+
+    def _get_or_create_col(self, ws: gspread.Worksheet,
+                           headers: list[str], name: str) -> int:
         if name in headers:
             return headers.index(name) + 1
         new_col = len(headers) + 1
         ws.update_cell(1, new_col, name)
-        ws.format(
-            gspread.utils.rowcol_to_a1(1, new_col),
-            {"textFormat": {"bold": True}},
-        )
+        ws.format(gspread.utils.rowcol_to_a1(1, new_col),
+                  {"textFormat": {"bold": True}})
         headers.append(name)
-        log.info("Добавлена новая колонка: %s", name)
         return new_col
 
-    def append_row(self, row: list[Any], extra_expenses: list[dict] | None = None, sheet_name: str | None = None) -> int:
-        """Добавляет строку. extra_expenses динамически создаёт колонки при необходимости."""
+    def append_row(self, row: list[Any],
+                   extra_expenses: list[dict] | None = None,
+                   sheet_name: str | None = None) -> int:
         target = sheet_name or self.sheet_name
         self.ensure_headers(target)
-        ws = self._get_worksheet(target)
+        ws = self._get_ws(target)
         headers = ws.row_values(1)
 
         if not extra_expenses:
             ws.append_row(row, value_input_option="USER_ENTERED")
             return len(ws.get_all_values())
 
-        # Нужны динамические колонки — пишем по ячейкам
         all_values = ws.get_all_values()
         next_row = len(all_values) + 1
+        cells = [gspread.Cell(next_row, i + 1, v) for i, v in enumerate(row)]
 
-        # Стандартные поля
-        cell_updates = []
-        for col_idx, value in enumerate(row, start=1):
-            cell_updates.append(gspread.Cell(next_row, col_idx, value))
-
-        # Дополнительные расходы
         for item in extra_expenses:
             name = item.get("name", "").strip()
             amount = item.get("amount", 0)
             if not name:
                 continue
-            col_idx = self._get_or_create_col(ws, headers, name)
-            cell_updates.append(gspread.Cell(next_row, col_idx, amount))
+            col = self._get_or_create_col(ws, headers, name)
+            cells.append(gspread.Cell(next_row, col, amount))
 
-        ws.update_cells(cell_updates, value_input_option="USER_ENTERED")
+        ws.update_cells(cells, value_input_option="USER_ENTERED")
         return next_row
 
+    # ── Dashboard ──────────────────────────────────────────────────────────
+
+    def get_stats(self, sheet_name: str | None = None, days: int = 7) -> dict:
+        """Возвращает агрегаты за последние N дней."""
+        ws = self._get_ws(sheet_name or self.sheet_name)
+        rows = ws.get_all_values()
+        if not rows:
+            return {}
+
+        headers = rows[0]
+        cutoff = date.today() - timedelta(days=days - 1)
+        totals: dict[str, float] = {}
+        count = 0
+
+        for row in rows[1:]:
+            if not row or not row[0]:
+                continue
+            # Пробуем разобрать дату
+            raw_date = row[0]
+            parsed_date = None
+            for fmt in ("%Y-%m-%d", "%d.%m.%Y"):
+                try:
+                    parsed_date = datetime.strptime(raw_date, fmt).date()
+                    break
+                except ValueError:
+                    continue
+            if parsed_date is None or parsed_date < cutoff:
+                continue
+
+            count += 1
+            for i, val in enumerate(row):
+                if i >= len(headers):
+                    break
+                col = headers[i]
+                if col == headers[0]:  # date column
+                    continue
+                try:
+                    n = float(str(val).replace(" ", "").replace(",", "."))
+                    totals[col] = totals.get(col, 0) + n
+                except (ValueError, TypeError):
+                    pass  # text columns
+
+        return {"days": days, "count": count, "totals": totals, "headers": headers}
+
+
+# Нужен для обратной совместимости импорта в config_manager
+from datetime import datetime
