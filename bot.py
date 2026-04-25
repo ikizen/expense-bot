@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
 import os
 import re
@@ -34,7 +35,7 @@ from telegram.ext import (
 import requests as http_requests
 from config_manager import ConfigManager
 from parser import ExpenseParser, format_preview
-from sheets import SheetsClient, create_new_spreadsheet
+from sheets import SheetsClient, create_new_spreadsheet, _build_gs_client
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -71,14 +72,64 @@ def _make_keyboard(token: str) -> InlineKeyboardMarkup:
 
 async def cmd_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     url = context.bot_data.get("spreadsheet_url", "")
-    sid = context.bot_data.get("spreadsheet_id", "")
     if url:
         await update.message.reply_text(
             f"📊 <b>Ссылка на таблицу:</b>\n{url}",
             parse_mode=ParseMode.HTML,
         )
     else:
-        await update.message.reply_text("Таблица не настроена. Задай SPREADSHEET_ID.")
+        sa_email = context.bot_data.get("service_account_email", "см. credentials.json")
+        await update.message.reply_text(
+            "⚠️ Таблица не настроена.\n\n"
+            "Чтобы подключить таблицу:\n"
+            "1. Создайте таблицу: https://sheets.new\n"
+            f"2. Поделитесь с: <code>{sa_email}</code> (роль «Редактор»)\n"
+            "3. Скопируйте ID из URL (часть между /d/ и /edit)\n"
+            "4. Отправьте: /setsheet ID",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+
+
+async def cmd_setsheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Привязать бота к существующей Google Таблице."""
+    if not _is_allowed(update, context.bot_data["allowed_users"]):
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Использование: /setsheet SPREADSHEET_ID\nID можно найти в URL таблицы.")
+        return
+    new_id = args[0].strip()
+    # Принять полный URL тоже
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", new_id)
+    if m:
+        new_id = m.group(1)
+
+    sheets: SheetsClient = context.bot_data["sheets"]
+    sheets.spreadsheet_id = new_id
+    sheets._ws_cache.clear()
+
+    cfg: ConfigManager = context.bot_data["config"]
+    cfg._spreadsheet_id = new_id
+
+    url = f"https://docs.google.com/spreadsheets/d/{new_id}"
+    context.bot_data["spreadsheet_id"] = new_id
+    context.bot_data["spreadsheet_url"] = url
+
+    # Инициализируем заголовки
+    try:
+        await asyncio.to_thread(sheets.ensure_headers)
+        _try_save_spreadsheet_id_to_railway(new_id)
+        await update.message.reply_text(
+            f"✅ Таблица подключена!\n📊 {url}",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Ошибка доступа к таблице: {html.escape(str(e))}\n"
+            "Проверь, что таблица расшарена с сервисным аккаунтом."
+        )
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -120,7 +171,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/stats — за 7 дней\n"
         "/stats Финансы 30 — лист Финансы, 30 дней\n\n"
         "<b>Конфиг</b>\n"
-        "/config — текущие настройки"
+        "/config — текущие настройки\n"
+        "/setsheet ID — подключить Google Таблицу по ID\n"
+        "/sheet — ссылка на текущую таблицу"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -522,30 +575,58 @@ def build_app() -> Application:
     owner_email   = os.environ.get("SPREADSHEET_OWNER_EMAIL", "").strip()
     spreadsheet_id = os.environ.get("SPREADSHEET_ID", "").strip()
 
-    # Временный клиент без config для авторизации Google
-    tmp_sheets = SheetsClient(creds_path, spreadsheet_id or "placeholder", sheet_name, config=None)  # type: ignore
+    # Авторизация Google один раз — переиспользуем клиент везде
+    gs_client = _build_gs_client(creds_path)
 
     # Автосоздание таблицы если SPREADSHEET_ID не задан
+    spreadsheet_url = ""
     if not spreadsheet_id:
-        log.info("SPREADSHEET_ID не задан — создаю новую таблицу…")
+        log.info("SPREADSHEET_ID не задан — пробую создать новую таблицу…")
         bot_name = os.environ.get("BOT_NAME", "Expense Bot")
-        spreadsheet_id, spreadsheet_url = create_new_spreadsheet(
-            gs_client=tmp_sheets.client,
-            title=bot_name,
-            folder_id=folder_id or None,
-            share_email=owner_email or None,
-        )
-        os.environ["SPREADSHEET_ID"] = spreadsheet_id
-        _try_save_spreadsheet_id_to_railway(spreadsheet_id)
+        try:
+            spreadsheet_id, spreadsheet_url = create_new_spreadsheet(
+                gs_client=gs_client,
+                title=bot_name,
+                folder_id=folder_id or None,
+                share_email=owner_email or None,
+            )
+            os.environ["SPREADSHEET_ID"] = spreadsheet_id
+            _try_save_spreadsheet_id_to_railway(spreadsheet_id)
+        except Exception as e:
+            log.error(
+                "❌ Не удалось создать Google Таблицу: %s\n"
+                "Создайте таблицу вручную:\n"
+                "  1. Откройте https://sheets.new\n"
+                "  2. Поделитесь с сервисным аккаунтом: %s\n"
+                "  3. Задайте переменную SPREADSHEET_ID=<id из URL>",
+                e,
+                owner_email or "см. credentials.json → client_email",
+            )
+            # Продолжаем работу без таблицы — бот запустится, но /sheet сообщит об ошибке
     else:
         spreadsheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
 
-    sheets = SheetsClient(creds_path, spreadsheet_id, sheet_name, config=None)  # type: ignore
-    config = ConfigManager(spreadsheet_id, sheets.client)
+    sheets = SheetsClient(
+        creds_path, spreadsheet_id or "placeholder", sheet_name,
+        config=None, gs_client=gs_client,  # type: ignore
+    )
+    config = ConfigManager(spreadsheet_id or "placeholder", gs_client)
     sheets.config = config
 
-    sheets.ensure_headers()
+    if spreadsheet_id:
+        sheets.ensure_headers()
     parser = ExpenseParser(api_key=groq_key, config=config)
+
+    # Извлекаем email сервисного аккаунта для инструкций
+    sa_email = ""
+    creds_json_env = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    try:
+        if creds_json_env:
+            sa_email = json.loads(creds_json_env).get("client_email", "")
+        elif os.path.exists(creds_path):
+            sa_email = json.loads(open(creds_path).read()).get("client_email", "")
+    except Exception:
+        pass
 
     app = Application.builder().token(tg_token).build()
     app.bot_data.update({
@@ -555,9 +636,11 @@ def build_app() -> Application:
         "allowed_users": allowed_users,
         "spreadsheet_id": spreadsheet_id,
         "spreadsheet_url": spreadsheet_url,
+        "service_account_email": sa_email,
     })
 
     app.add_handler(CommandHandler("sheet",       cmd_sheet))
+    app.add_handler(CommandHandler("setsheet",    cmd_setsheet))
     app.add_handler(CommandHandler("start",       cmd_start))
     app.add_handler(CommandHandler("help",        cmd_help))
     app.add_handler(CommandHandler("config",      cmd_config))

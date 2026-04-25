@@ -90,8 +90,9 @@ def _build_gs_client(creds_path: str) -> gspread.Client:
 
 class SheetsClient:
     def __init__(self, creds_path: str, spreadsheet_id: str,
-                 sheet_name: str, config: "ConfigManager"):
-        self.client = _build_gs_client(creds_path)
+                 sheet_name: str, config: "ConfigManager",
+                 gs_client: gspread.Client | None = None):
+        self.client = gs_client or _build_gs_client(creds_path)
         self.spreadsheet_id = spreadsheet_id
         self.sheet_name = sheet_name
         self.config = config
