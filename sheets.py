@@ -117,15 +117,18 @@ class SheetsClient:
             ws.format("A1:Z1", {"textFormat": {"bold": True}})
             log.info("Заголовки записаны на листе '%s'.", name)
 
-    def create_sheet(self, sheet_name: str) -> bool:
-        """Создаёт новый лист. False если уже существует."""
+    def create_sheet(self, sheet_name: str,
+                     headers: list[str] | None = None) -> bool:
+        """Создаёт новый лист с заданными (или всеми) заголовками.
+        Возвращает False если лист уже существует."""
         sh = self.client.open_by_key(self.spreadsheet_id)
         try:
             sh.worksheet(sheet_name)
             return False
         except gspread.WorksheetNotFound:
             ws = sh.add_worksheet(title=sheet_name, rows=1000, cols=30)
-            ws.update("A1", [self.config.headers])
+            hdrs = headers if headers is not None else self.config.headers
+            ws.update("A1", [hdrs])
             ws.format("A1:Z1", {"textFormat": {"bold": True}})
             self._ws_cache[sheet_name] = ws
             return True
@@ -144,25 +147,34 @@ class SheetsClient:
     def append_row(self, row: list[Any],
                    extra_expenses: list[dict] | None = None,
                    sheet_name: str | None = None) -> int:
+        """Добавляет строку, сопоставляя значения по названию колонки.
+        Работает корректно даже если у листа нестандартный набор столбцов."""
         target = sheet_name or self.sheet_name
         self.ensure_headers(target)
         ws = self._get_ws(target)
-        headers = ws.row_values(1)
+        sheet_headers = ws.row_values(1)      # реальные заголовки этого листа
+        config_headers = self.config.headers  # все метки из конфига (в том же порядке что row)
 
-        if not extra_expenses:
-            ws.append_row(row, value_input_option="USER_ENTERED")
-            return len(ws.get_all_values())
+        # Строим словарь метка → значение из полного row
+        value_map: dict[str, Any] = dict(zip(config_headers, row))
 
         all_values = ws.get_all_values()
         next_row = len(all_values) + 1
-        cells = [gspread.Cell(next_row, i + 1, v) for i, v in enumerate(row)]
 
-        for item in extra_expenses:
+        # Только те колонки, которые есть на этом листе
+        cells = [
+            gspread.Cell(next_row, col_idx + 1, value_map[hdr])
+            for col_idx, hdr in enumerate(sheet_headers)
+            if hdr in value_map
+        ]
+
+        # Доп. расходы (динамические колонки)
+        for item in (extra_expenses or []):
             name = item.get("name", "").strip()
             amount = item.get("amount", 0)
             if not name:
                 continue
-            col = self._get_or_create_col(ws, headers, name)
+            col = self._get_or_create_col(ws, sheet_headers, name)
             cells.append(gspread.Cell(next_row, col, amount))
 
         ws.update_cells(cells, value_input_option="USER_ENTERED")

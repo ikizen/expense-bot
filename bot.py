@@ -45,6 +45,8 @@ log = logging.getLogger("bot")
 
 PENDING: dict[str, dict[str, Any]] = {}
 EDIT_WAITING: dict[int, str] = {}
+# Состояние мастера создания листа: user_id → {name, selected: set[label]}
+NEW_SHEET_PENDING: dict[int, dict] = {}
 
 
 def _parse_user_ids(raw: str | None) -> set[int]:
@@ -267,6 +269,41 @@ async def cmd_removealias(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 # ── Листы ─────────────────────────────────────────────────────────────────
 
+def _newsheet_keyboard(user_id: int, cfg: ConfigManager) -> InlineKeyboardMarkup:
+    """Клавиатура выбора столбцов для нового листа."""
+    state = NEW_SHEET_PENDING.get(user_id, {})
+    selected: set[str] = state.get("selected", set())
+    fields = cfg.fields
+
+    # Кнопки столбцов — по 2 в ряд
+    rows: list[list[InlineKeyboardButton]] = []
+    pair: list[InlineKeyboardButton] = []
+    for f in fields:
+        label = f["label"]
+        mark = "✅" if label in selected else "☐"
+        btn = InlineKeyboardButton(
+            f"{mark} {label}",
+            callback_data=f"nst:{user_id}:{f['key']}",
+        )
+        pair.append(btn)
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+
+    selected_count = len(selected)
+    total_count = len(fields)
+    rows.append([
+        InlineKeyboardButton(
+            f"✅ Создать лист ({selected_count}/{total_count})",
+            callback_data=f"nsc:{user_id}",
+        ),
+        InlineKeyboardButton("❌ Отмена", callback_data=f"nsx:{user_id}"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
 async def cmd_newsheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(update, context.bot_data["allowed_users"]):
         return
@@ -275,18 +312,21 @@ async def cmd_newsheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Использование: /newsheet Название")
         return
     name = " ".join(args)
-    sheets: SheetsClient = context.bot_data["sheets"]
-    try:
-        created = await asyncio.to_thread(sheets.create_sheet, name)
-        if created:
-            await update.message.reply_text(
-                f"✅ Лист <b>{name}</b> создан с текущими заголовками.\n"
-                f"Чтобы направлять отчёты туда: /addroute ключслово {name}",
-                parse_mode=ParseMode.HTML)
-        else:
-            await update.message.reply_text(f"Лист <b>{name}</b> уже существует.", parse_mode=ParseMode.HTML)
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка: {html.escape(str(e))}")
+    cfg: ConfigManager = context.bot_data["config"]
+    user_id = update.effective_user.id
+
+    # Инициализируем состояние — все столбцы выбраны по умолчанию
+    NEW_SHEET_PENDING[user_id] = {
+        "name": name,
+        "selected": {f["label"] for f in cfg.fields},
+    }
+
+    await update.message.reply_text(
+        f"📋 Новый лист: <b>{html.escape(name)}</b>\n\n"
+        "Выбери столбцы (все выбраны — нажимай чтобы убрать лишние):",
+        reply_markup=_newsheet_keyboard(user_id, cfg),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def cmd_addroute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -484,8 +524,74 @@ async def _handle_edit_correction(
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    action, _, token = (query.data or "").partition(":")
+    data = query.data or ""
     cfg: ConfigManager = context.bot_data["config"]
+
+    # ── Мастер создания нового листа ──────────────────────────────────────
+    if data.startswith("nst:"):        # toggle столбца
+        _, uid_str, fkey = data.split(":", 2)
+        uid = int(uid_str)
+        if uid not in NEW_SHEET_PENDING:
+            await query.edit_message_text("Сессия истекла. Запусти /newsheet заново.")
+            return
+        state = NEW_SHEET_PENDING[uid]
+        # Находим метку по ключу
+        label = next((f["label"] for f in cfg.fields if f["key"] == fkey), None)
+        if label:
+            if label in state["selected"]:
+                state["selected"].discard(label)
+            else:
+                state["selected"].add(label)
+        await query.edit_message_reply_markup(
+            reply_markup=_newsheet_keyboard(uid, cfg)
+        )
+        return
+
+    if data.startswith("nsc:"):        # создать лист
+        uid = int(data.split(":", 1)[1])
+        state = NEW_SHEET_PENDING.pop(uid, None)
+        if not state:
+            await query.edit_message_text("Сессия истекла. Запусти /newsheet заново.")
+            return
+        name = state["name"]
+        selected_labels = state["selected"]
+        if not selected_labels:
+            await query.answer("Выбери хотя бы один столбец!", show_alert=True)
+            NEW_SHEET_PENDING[uid] = state  # вернуть состояние
+            return
+
+        # Сортируем по порядку конфига
+        ordered = [f["label"] for f in cfg.fields if f["label"] in selected_labels]
+        sheets: SheetsClient = context.bot_data["sheets"]
+        try:
+            created = await asyncio.to_thread(sheets.create_sheet, name, ordered)
+        except Exception as e:
+            await query.edit_message_text(f"Ошибка: {html.escape(str(e))}")
+            return
+        if created:
+            cols_text = " | ".join(ordered)
+            await query.edit_message_text(
+                f"✅ Лист <b>{html.escape(name)}</b> создан!\n\n"
+                f"<b>Столбцы:</b> {html.escape(cols_text)}\n\n"
+                f"Чтобы отправлять отчёты туда:\n"
+                f"/addroute ключевоеслово {html.escape(name)}",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await query.edit_message_text(
+                f"Лист <b>{html.escape(name)}</b> уже существует.",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+
+    if data.startswith("nsx:"):        # отмена
+        uid = int(data.split(":", 1)[1])
+        NEW_SHEET_PENDING.pop(uid, None)
+        await query.edit_message_text("Отменено.")
+        return
+
+    # ── Обычные кнопки отчёта (ok / edit / no) ────────────────────────────
+    action, _, token = data.partition(":")
 
     if action == "edit":
         if token not in PENDING:
