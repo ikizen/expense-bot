@@ -9,7 +9,9 @@ import os
 from datetime import date, timedelta
 from typing import Any, TYPE_CHECKING
 
+import requests as http_requests
 import gspread
+from google.auth.transport.requests import Request
 from google.oauth2.service_account import Credentials
 
 if TYPE_CHECKING:
@@ -21,6 +23,48 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
+
+
+def create_new_spreadsheet(
+    gs_client: gspread.Client,
+    title: str,
+    folder_id: str | None = None,
+    share_email: str | None = None,
+) -> tuple[str, str]:
+    """
+    Создаёт новую Google Таблицу.
+    Возвращает (spreadsheet_id, url).
+    """
+    sh = gs_client.create(title)
+    sid = sh.id
+    url = f"https://docs.google.com/spreadsheets/d/{sid}"
+    log.info("Создана таблица: %s", url)
+
+    # Переместить в папку Drive
+    if folder_id:
+        try:
+            creds = gs_client.auth
+            if not creds.valid:
+                creds.refresh(Request())
+            resp = http_requests.patch(
+                f"https://www.googleapis.com/drive/v3/files/{sid}",
+                headers={"Authorization": f"Bearer {creds.token}"},
+                params={"addParents": folder_id, "removeParents": "root"},
+            )
+            resp.raise_for_status()
+            log.info("Таблица перемещена в папку %s", folder_id)
+        except Exception as e:
+            log.warning("Не удалось переместить в папку: %s", e)
+
+    # Поделиться с владельцем
+    if share_email:
+        try:
+            sh.share(share_email, perm_type="user", role="writer", notify=True)
+            log.info("Таблица расшарена с %s", share_email)
+        except Exception as e:
+            log.warning("Не удалось поделиться с %s: %s", share_email, e)
+
+    return sid, url
 
 
 def _build_gs_client(creds_path: str) -> gspread.Client:

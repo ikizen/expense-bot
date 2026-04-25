@@ -31,9 +31,10 @@ from telegram.ext import (
     ContextTypes, MessageHandler, filters,
 )
 
+import requests as http_requests
 from config_manager import ConfigManager
 from parser import ExpenseParser, format_preview
-from sheets import SheetsClient
+from sheets import SheetsClient, create_new_spreadsheet
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -68,9 +69,23 @@ def _make_keyboard(token: str) -> InlineKeyboardMarkup:
 
 # ── Стандартные команды ────────────────────────────────────────────────────
 
+async def cmd_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    url = context.bot_data.get("spreadsheet_url", "")
+    sid = context.bot_data.get("spreadsheet_id", "")
+    if url:
+        await update.message.reply_text(
+            f"📊 <b>Ссылка на таблицу:</b>\n{url}",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        await update.message.reply_text("Таблица не настроена. Задай SPREADSHEET_ID.")
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: ConfigManager = context.bot_data["config"]
     triggers = " / ".join(f"<b>{t.capitalize()}</b>" for t in cfg.triggers)
+    url = context.bot_data.get("spreadsheet_url", "")
+    sheet_line = f'\n📊 <a href="{url}">Открыть таблицу</a>' if url else ""
     await update.message.reply_text(
         f"Привет! Пришли отчёт — начни сообщение со слова {triggers}.\n\n"
         "Пример:\n"
@@ -78,9 +93,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Каспи 120к, нал 45к\n"
         "Кассир Айгуль\n"
         "Лиды: инст 12, вц 7\n"
-        "Расходы: курьеры 8000, закуп гортензии 60к</i>\n\n"
-        "/help — все команды",
+        "Расходы: курьеры 8000, закуп гортензии 60к</i>"
+        f"{sheet_line}\n\n"
+        "/help — все команды  /sheet — ссылка на таблицу",
         parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
     )
 
 
@@ -466,19 +483,66 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── Bootstrap ──────────────────────────────────────────────────────────────
 
+def _try_save_spreadsheet_id_to_railway(spreadsheet_id: str) -> None:
+    """Обновляет SPREADSHEET_ID в Railway через API (если токен доступен)."""
+    token    = os.environ.get("RAILWAY_API_TOKEN")
+    svc_id   = os.environ.get("RAILWAY_SERVICE_ID")
+    env_id   = os.environ.get("RAILWAY_ENVIRONMENT_ID")
+    proj_id  = os.environ.get("RAILWAY_PROJECT_ID")
+    if not all([token, svc_id, env_id, proj_id]):
+        log.info("Railway API недоступен — задай SPREADSHEET_ID вручную: %s", spreadsheet_id)
+        return
+    try:
+        resp = http_requests.post(
+            "https://backboard.railway.app/graphql/v2",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={
+                "query": "mutation U($p:String!,$e:String!,$s:String!,$n:String!,$v:String!)"
+                         "{variableUpsert(input:{projectId:$p,environmentId:$e,serviceId:$s,name:$n,value:$v})}",
+                "variables": {"p": proj_id, "e": env_id, "s": svc_id,
+                              "n": "SPREADSHEET_ID", "v": spreadsheet_id},
+            },
+            timeout=10,
+        )
+        if resp.json().get("data", {}).get("variableUpsert"):
+            log.info("SPREADSHEET_ID сохранён в Railway env.")
+    except Exception as e:
+        log.warning("Не удалось сохранить в Railway: %s", e)
+
+
 def build_app() -> Application:
     load_dotenv()
 
     tg_token      = os.environ["TELEGRAM_BOT_TOKEN"]
     groq_key      = os.environ["GROQ_API_KEY"]
-    spreadsheet_id = os.environ["SPREADSHEET_ID"]
     sheet_name    = os.environ.get("SHEET_NAME", "Отчёты")
     creds_path    = os.environ.get("GOOGLE_CREDENTIALS_PATH", "credentials.json")
     allowed_users = _parse_user_ids(os.environ.get("ALLOWED_USER_IDS"))
+    folder_id     = os.environ.get("DRIVE_FOLDER_ID", "").strip()
+    owner_email   = os.environ.get("SPREADSHEET_OWNER_EMAIL", "").strip()
+    spreadsheet_id = os.environ.get("SPREADSHEET_ID", "").strip()
+
+    # Временный клиент без config для авторизации Google
+    tmp_sheets = SheetsClient(creds_path, spreadsheet_id or "placeholder", sheet_name, config=None)  # type: ignore
+
+    # Автосоздание таблицы если SPREADSHEET_ID не задан
+    if not spreadsheet_id:
+        log.info("SPREADSHEET_ID не задан — создаю новую таблицу…")
+        bot_name = os.environ.get("BOT_NAME", "Expense Bot")
+        spreadsheet_id, spreadsheet_url = create_new_spreadsheet(
+            gs_client=tmp_sheets.client,
+            title=bot_name,
+            folder_id=folder_id or None,
+            share_email=owner_email or None,
+        )
+        os.environ["SPREADSHEET_ID"] = spreadsheet_id
+        _try_save_spreadsheet_id_to_railway(spreadsheet_id)
+    else:
+        spreadsheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
 
     sheets = SheetsClient(creds_path, spreadsheet_id, sheet_name, config=None)  # type: ignore
     config = ConfigManager(spreadsheet_id, sheets.client)
-    sheets.config = config  # wire up
+    sheets.config = config
 
     sheets.ensure_headers()
     parser = ExpenseParser(api_key=groq_key, config=config)
@@ -489,8 +553,11 @@ def build_app() -> Application:
         "sheets": sheets,
         "config": config,
         "allowed_users": allowed_users,
+        "spreadsheet_id": spreadsheet_id,
+        "spreadsheet_url": spreadsheet_url,
     })
 
+    app.add_handler(CommandHandler("sheet",       cmd_sheet))
     app.add_handler(CommandHandler("start",       cmd_start))
     app.add_handler(CommandHandler("help",        cmd_help))
     app.add_handler(CommandHandler("config",      cmd_config))
