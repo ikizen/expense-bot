@@ -32,33 +32,39 @@ def create_new_spreadsheet(
     share_email: str | None = None,
 ) -> tuple[str, str]:
     """
-    Создаёт новую Google Таблицу.
+    Создаёт новую Google Таблицу напрямую в указанной папке Drive.
+    Это обходит квоту хранилища сервисного аккаунта.
     Возвращает (spreadsheet_id, url).
     """
-    sh = gs_client.create(title)
-    sid = sh.id
+    creds = gs_client.auth
+    if not creds.valid:
+        creds.refresh(Request())
+
+    headers = {
+        "Authorization": f"Bearer {creds.token}",
+        "Content-Type": "application/json",
+    }
+    body: dict = {
+        "name": title,
+        "mimeType": "application/vnd.google-apps.spreadsheet",
+    }
+    if folder_id:
+        body["parents"] = [folder_id]
+
+    resp = http_requests.post(
+        "https://www.googleapis.com/drive/v3/files",
+        headers=headers,
+        json=body,
+    )
+    resp.raise_for_status()
+    sid = resp.json()["id"]
     url = f"https://docs.google.com/spreadsheets/d/{sid}"
     log.info("Создана таблица: %s", url)
-
-    # Переместить в папку Drive
-    if folder_id:
-        try:
-            creds = gs_client.auth
-            if not creds.valid:
-                creds.refresh(Request())
-            resp = http_requests.patch(
-                f"https://www.googleapis.com/drive/v3/files/{sid}",
-                headers={"Authorization": f"Bearer {creds.token}"},
-                params={"addParents": folder_id, "removeParents": "root"},
-            )
-            resp.raise_for_status()
-            log.info("Таблица перемещена в папку %s", folder_id)
-        except Exception as e:
-            log.warning("Не удалось переместить в папку: %s", e)
 
     # Поделиться с владельцем
     if share_email:
         try:
+            sh = gs_client.open_by_key(sid)
             sh.share(share_email, perm_type="user", role="writer", notify=True)
             log.info("Таблица расшарена с %s", share_email)
         except Exception as e:
