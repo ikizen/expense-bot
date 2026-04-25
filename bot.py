@@ -25,7 +25,11 @@ import uuid
 from typing import Any
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton, InlineKeyboardMarkup,
+    KeyboardButton, ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler,
@@ -47,6 +51,18 @@ PENDING: dict[str, dict[str, Any]] = {}
 EDIT_WAITING: dict[int, str] = {}
 # Состояние мастера создания листа: user_id → {name, selected: set[label]}
 NEW_SHEET_PENDING: dict[int, dict] = {}
+# Ожидание текстового ввода из меню настроек
+SETTINGS_WAITING: dict[int, dict] = {}
+# {user_id: {action: str, chat_id: int, msg_id: int}}
+
+# Нижняя клавиатура — всегда видна
+MAIN_KB = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("📊 Статистика"), KeyboardButton("🔗 Таблица")],
+        [KeyboardButton("⚙️ Настройки"),  KeyboardButton("❓ Помощь")],
+    ],
+    resize_keyboard=True,
+)
 
 
 def _parse_user_ids(raw: str | None) -> set[int]:
@@ -147,10 +163,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Кассир Айгуль\n"
         "Лиды: инст 12, вц 7\n"
         "Расходы: курьеры 8000, закуп гортензии 60к</i>"
-        f"{sheet_line}\n\n"
-        "/help — все команды  /sheet — ссылка на таблицу",
+        f"{sheet_line}",
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
+        reply_markup=MAIN_KB,
     )
 
 
@@ -268,6 +284,170 @@ async def cmd_removealias(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ── Листы ─────────────────────────────────────────────────────────────────
+
+# ── Меню настроек ─────────────────────────────────────────────────────────
+
+def _settings_main_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📋 Колонки",   callback_data="m_cols"),
+            InlineKeyboardButton("🔀 Маршруты",  callback_data="m_routes"),
+        ],
+        [
+            InlineKeyboardButton("💬 Алиасы",    callback_data="m_aliases"),
+            InlineKeyboardButton("📄 Новый лист", callback_data="m_newsheet_menu"),
+        ],
+        [InlineKeyboardButton("❌ Закрыть", callback_data="m_close")],
+    ])
+
+
+def _cols_text_and_kb(cfg: ConfigManager) -> tuple[str, InlineKeyboardMarkup]:
+    lines = [f"📋 <b>Колонки ({len(cfg.fields)}):</b>\n"]
+    rows: list[list[InlineKeyboardButton]] = []
+    for f in cfg.fields:
+        protected = f["key"] in {"date", "kassir"}
+        lock = " 🔒" if protected else ""
+        lines.append(f"  • {f['label']} ({f['type']}){lock}")
+        if not protected:
+            rows.append([InlineKeyboardButton(
+                f"➖ {f['label']}", callback_data=f"m_cdel:{f['key']}",
+            )])
+    rows += [
+        [
+            InlineKeyboardButton("➕ Числовая",   callback_data="m_cadd_n"),
+            InlineKeyboardButton("➕ Текстовая",  callback_data="m_cadd_t"),
+        ],
+        [InlineKeyboardButton("◀️ Назад", callback_data="m_main")],
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def _routes_text_and_kb(cfg: ConfigManager) -> tuple[str, InlineKeyboardMarkup]:
+    routes = cfg.routes
+    if routes:
+        lines = ["🔀 <b>Маршруты:</b>\n"]
+        rows: list[list[InlineKeyboardButton]] = []
+        for kw, sheet in routes.items():
+            lines.append(f"  • «{kw}» → <b>{html.escape(sheet)}</b>")
+            rows.append([InlineKeyboardButton(
+                f"➖ «{kw}»", callback_data=f"m_rdel:{kw[:28]}",
+            )])
+    else:
+        lines = ["🔀 <b>Маршруты:</b>\n", "  Пусто — все идёт на основной лист."]
+        rows = []
+    rows += [
+        [InlineKeyboardButton("➕ Добавить маршрут", callback_data="m_radd")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="m_main")],
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def _aliases_text_and_kb(cfg: ConfigManager) -> tuple[str, InlineKeyboardMarkup]:
+    aliases = cfg.aliases
+    if aliases:
+        lines = ["💬 <b>Алиасы:</b>\n"]
+        rows: list[list[InlineKeyboardButton]] = []
+        for word, target in aliases.items():
+            lines.append(f"  • {word} → {target}")
+            rows.append([InlineKeyboardButton(
+                f"➖ {word}", callback_data=f"m_adel:{word[:30]}",
+            )])
+    else:
+        lines = ["💬 <b>Алиасы:</b>\n", "  Пусто."]
+        rows = []
+    rows += [
+        [InlineKeyboardButton("➕ Добавить алиас", callback_data="m_aadd")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="m_main")],
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_allowed(update, context.bot_data["allowed_users"]):
+        return
+    cfg: ConfigManager = context.bot_data["config"]
+    text = (
+        "⚙️ <b>Настройки бота</b>\n\n"
+        f"Полей: <b>{len(cfg.fields)}</b>  |  "
+        f"Алиасов: <b>{len(cfg.aliases)}</b>  |  "
+        f"Маршрутов: <b>{len(cfg.routes)}</b>"
+    )
+    await update.message.reply_text(
+        text, reply_markup=_settings_main_kb(), parse_mode=ParseMode.HTML,
+    )
+
+
+async def _handle_settings_input(
+        update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """Обрабатывает текстовый ввод пользователя в режиме ожидания настроек."""
+    user_id = update.effective_user.id
+    state = SETTINGS_WAITING.pop(user_id, None)
+    if not state:
+        return
+    cfg: ConfigManager = context.bot_data["config"]
+    action = state["action"]
+    chat_id = state["chat_id"]
+    msg_id  = state["msg_id"]
+
+    async def _back_to(new_text: str, kb: InlineKeyboardMarkup) -> None:
+        """Редактирует сообщение-меню и удаляет сообщение пользователя."""
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=msg_id,
+                text=new_text, reply_markup=kb, parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+    text = text.strip()
+
+    if action in ("col_num", "col_txt"):
+        ftype = "number" if action == "col_num" else "text"
+        if cfg.add_field(text, ftype):
+            t, kb = _cols_text_and_kb(cfg)
+            await _back_to(t + f"\n\n✅ Добавлена: <b>{html.escape(text)}</b>", kb)
+        else:
+            t, kb = _cols_text_and_kb(cfg)
+            await _back_to(t + f"\n\n⚠️ Уже существует: <b>{html.escape(text)}</b>", kb)
+
+    elif action == "route":
+        parts = text.split(None, 1)
+        if len(parts) == 2:
+            cfg.add_route(parts[0], parts[1])
+            t, kb = _routes_text_and_kb(cfg)
+            await _back_to(
+                t + f"\n\n✅ Добавлен: «{html.escape(parts[0])}» → <b>{html.escape(parts[1])}</b>", kb,
+            )
+        else:
+            SETTINGS_WAITING[user_id] = state   # вернуть ожидание
+            await update.message.reply_text(
+                "⚠️ Формат: <code>ключслово НазваниеЛиста</code>\n"
+                "Пример: <code>финансы Финансы</code>",
+                parse_mode=ParseMode.HTML,
+            )
+
+    elif action == "alias":
+        parts = text.split(None, 1)
+        if len(parts) == 2:
+            cfg.add_alias(parts[0], parts[1])
+            t, kb = _aliases_text_and_kb(cfg)
+            await _back_to(
+                t + f"\n\n✅ Добавлен: {html.escape(parts[0])} → <b>{html.escape(parts[1])}</b>", kb,
+            )
+        else:
+            SETTINGS_WAITING[user_id] = state
+            await update.message.reply_text(
+                "⚠️ Формат: <code>слово Целевая Метка</code>\n"
+                "Пример: <code>гортензия Закуп Цветов</code>",
+                parse_mode=ParseMode.HTML,
+            )
+
+
+# ── Мастер создания нового листа ──────────────────────────────────────────
 
 def _newsheet_keyboard(user_id: int, cfg: ConfigManager) -> InlineKeyboardMarkup:
     """Клавиатура выбора столбцов для нового листа."""
@@ -462,6 +642,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _handle_edit_correction(update, context, text)
         return
 
+    # Кнопки нижней клавиатуры
+    if text == "📊 Статистика":
+        await cmd_stats(update, context)
+        return
+    if text == "🔗 Таблица":
+        await cmd_sheet(update, context)
+        return
+    if text == "⚙️ Настройки":
+        await cmd_menu(update, context)
+        return
+    if text == "❓ Помощь":
+        await cmd_help(update, context)
+        return
+
+    # Ожидание текстового ввода из меню настроек
+    if user_id in SETTINGS_WAITING:
+        await _handle_settings_input(update, context, text)
+        return
+
     # Проверяем триггерные слова
     cfg: ConfigManager = context.bot_data["config"]
     if not re.search(cfg.trigger_pattern(), text, re.IGNORECASE):
@@ -588,6 +787,139 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         uid = int(data.split(":", 1)[1])
         NEW_SHEET_PENDING.pop(uid, None)
         await query.edit_message_text("Отменено.")
+        return
+
+    # ── Меню настроек (m_*) ────────────────────────────────────────────────
+    if data.startswith("m_"):
+        cfg: ConfigManager = context.bot_data["config"]
+        uid = query.from_user.id
+
+        if data == "m_main":
+            t = (
+                "⚙️ <b>Настройки бота</b>\n\n"
+                f"Полей: <b>{len(cfg.fields)}</b>  |  "
+                f"Алиасов: <b>{len(cfg.aliases)}</b>  |  "
+                f"Маршрутов: <b>{len(cfg.routes)}</b>"
+            )
+            await query.edit_message_text(t, reply_markup=_settings_main_kb(), parse_mode=ParseMode.HTML)
+
+        elif data == "m_cols":
+            t, kb = _cols_text_and_kb(cfg)
+            await query.edit_message_text(t, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+        elif data.startswith("m_cdel:"):
+            fkey = data[7:]
+            label = next((f["label"] for f in cfg.fields if f["key"] == fkey), fkey)
+            result = cfg.remove_field(label)
+            t, kb = _cols_text_and_kb(cfg)
+            suffix = f"\n\n✅ Удалена: <b>{html.escape(label)}</b>" if result == "ok" else ""
+            await query.edit_message_text(t + suffix, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+        elif data in ("m_cadd_n", "m_cadd_t"):
+            kind = "числовую" if data == "m_cadd_n" else "текстовую"
+            action_key = "col_num" if data == "m_cadd_n" else "col_txt"
+            SETTINGS_WAITING[uid] = {
+                "action": action_key,
+                "chat_id": query.message.chat_id,
+                "msg_id": query.message.message_id,
+            }
+            await query.edit_message_text(
+                f"✏️ Введи название новой <b>{kind}</b> колонки:\n\n"
+                "<i>Просто напиши название в чат</i>",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Отмена", callback_data="m_cols_cancel")
+                ]]),
+                parse_mode=ParseMode.HTML,
+            )
+
+        elif data == "m_cols_cancel":
+            SETTINGS_WAITING.pop(uid, None)
+            t, kb = _cols_text_and_kb(cfg)
+            await query.edit_message_text(t, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+        elif data == "m_routes":
+            t, kb = _routes_text_and_kb(cfg)
+            await query.edit_message_text(t, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+        elif data.startswith("m_rdel:"):
+            kw = data[7:]
+            cfg.remove_route(kw)
+            t, kb = _routes_text_and_kb(cfg)
+            await query.edit_message_text(
+                t + f"\n\n✅ Маршрут «{html.escape(kw)}» удалён.",
+                reply_markup=kb, parse_mode=ParseMode.HTML,
+            )
+
+        elif data == "m_radd":
+            SETTINGS_WAITING[uid] = {
+                "action": "route",
+                "chat_id": query.message.chat_id,
+                "msg_id": query.message.message_id,
+            }
+            await query.edit_message_text(
+                "✏️ Введи маршрут в формате:\n"
+                "<code>ключслово НазваниеЛиста</code>\n\n"
+                "Пример:\n<code>финансы Финансы</code>",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Отмена", callback_data="m_routes_cancel")
+                ]]),
+                parse_mode=ParseMode.HTML,
+            )
+
+        elif data == "m_routes_cancel":
+            SETTINGS_WAITING.pop(uid, None)
+            t, kb = _routes_text_and_kb(cfg)
+            await query.edit_message_text(t, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+        elif data == "m_aliases":
+            t, kb = _aliases_text_and_kb(cfg)
+            await query.edit_message_text(t, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+        elif data.startswith("m_adel:"):
+            word = data[7:]
+            cfg.remove_alias(word)
+            t, kb = _aliases_text_and_kb(cfg)
+            await query.edit_message_text(
+                t + f"\n\n✅ Алиас «{html.escape(word)}» удалён.",
+                reply_markup=kb, parse_mode=ParseMode.HTML,
+            )
+
+        elif data == "m_aadd":
+            SETTINGS_WAITING[uid] = {
+                "action": "alias",
+                "chat_id": query.message.chat_id,
+                "msg_id": query.message.message_id,
+            }
+            await query.edit_message_text(
+                "✏️ Введи алиас в формате:\n"
+                "<code>слово Целевая Метка</code>\n\n"
+                "Пример:\n<code>гортензия Закуп Цветов</code>",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Отмена", callback_data="m_aliases_cancel")
+                ]]),
+                parse_mode=ParseMode.HTML,
+            )
+
+        elif data == "m_aliases_cancel":
+            SETTINGS_WAITING.pop(uid, None)
+            t, kb = _aliases_text_and_kb(cfg)
+            await query.edit_message_text(t, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+        elif data == "m_newsheet_menu":
+            await query.edit_message_text(
+                "Напиши команду:\n<code>/newsheet Название</code>\n\n"
+                "Например: <code>/newsheet Финансы</code>\n\n"
+                "После этого выберешь столбцы кнопками.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("◀️ Назад", callback_data="m_main")
+                ]]),
+                parse_mode=ParseMode.HTML,
+            )
+
+        elif data == "m_close":
+            SETTINGS_WAITING.pop(uid, None)
+            await query.edit_message_text("Настройки закрыты.")
+
         return
 
     # ── Обычные кнопки отчёта (ok / edit / no) ────────────────────────────
@@ -745,6 +1077,7 @@ def build_app() -> Application:
         "service_account_email": sa_email,
     })
 
+    app.add_handler(CommandHandler("menu",        cmd_menu))
     app.add_handler(CommandHandler("sheet",       cmd_sheet))
     app.add_handler(CommandHandler("setsheet",    cmd_setsheet))
     app.add_handler(CommandHandler("start",       cmd_start))
