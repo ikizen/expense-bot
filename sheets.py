@@ -109,13 +109,42 @@ class SheetsClient:
             self._ws_cache[sheet_name] = ws
         return self._ws_cache[sheet_name]
 
+    def _ensure_enough_cols(self, ws: gspread.Worksheet, needed: int) -> None:
+        """Расширяет лист если нужных колонок не хватает."""
+        if ws.col_count < needed:
+            new_cols = needed + 10  # +10 запас под extra_expenses
+            ws.resize(rows=ws.row_count, cols=new_cols)
+            log.info("Лист '%s' расширен до %d колонок", ws.title, new_cols)
+
     def ensure_headers(self, sheet_name: str | None = None) -> None:
         name = sheet_name or self.sheet_name
         ws = self._get_ws(name)
-        if not ws.row_values(1):
-            ws.update("A1", [self.config.headers])
+        existing = ws.row_values(1)
+        headers = self.config.headers
+
+        if not existing:
+            # Новый лист — пишем все заголовки сразу
+            self._ensure_enough_cols(ws, len(headers))
+            ws.update("A1", [headers])
             ws.format("A1:Z1", {"textFormat": {"bold": True}})
             log.info("Заголовки записаны на листе '%s'.", name)
+        else:
+            # Лист уже есть — дописываем только отсутствующие заголовки
+            existing_set = set(existing)
+            missing = [h for h in headers if h not in existing_set]
+            if missing:
+                start_col = len(existing) + 1
+                self._ensure_enough_cols(ws, start_col + len(missing) - 1)
+                for i, h in enumerate(missing):
+                    col = start_col + i
+                    ws.update_cell(1, col, h)
+                    ws.format(
+                        gspread.utils.rowcol_to_a1(1, col),
+                        {"textFormat": {"bold": True}},
+                    )
+                log.info("Добавлены заголовки на лист '%s': %s", name, missing)
+                # Сбрасываем кэш чтобы sheet_headers в append_row был актуальным
+                self._ws_cache.pop(name, None)
 
     def create_sheet(self, sheet_name: str,
                      headers: list[str] | None = None) -> bool:
@@ -146,6 +175,8 @@ class SheetsClient:
         if name in headers:
             return headers.index(name) + 1
         new_col = len(headers) + 1
+        # Расширяем лист если новая колонка выходит за лимит
+        self._ensure_enough_cols(ws, new_col)
         ws.update_cell(1, new_col, name)
         ws.format(gspread.utils.rowcol_to_a1(1, new_col),
                   {"textFormat": {"bold": True}})
