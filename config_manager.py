@@ -49,6 +49,8 @@ class ConfigManager:
         self._spreadsheet_id = spreadsheet_id
         self._gs = gs_client
         self._cfg: dict[str, Any] = {}
+        # FIX #16: кэш скомпилированного паттерна триггеров
+        self._trigger_pattern_cache: str | None = None
         self.load()
 
     # ── Загрузка / сохранение ──────────────────────────────────────────────
@@ -61,6 +63,7 @@ class ConfigManager:
                 raw = ws.acell("A1").value
                 if raw:
                     self._cfg = json.loads(raw)
+                    self._trigger_pattern_cache = None  # инвалидируем кэш
                     log.info("Конфиг загружен из Google Sheets")
                     return
             except gspread.WorksheetNotFound:
@@ -72,6 +75,8 @@ class ConfigManager:
         self.save()
 
     def save(self) -> None:
+        """FIX #2: raise при ошибке сохранения — вызывающий код узнает о проблеме."""
+        self._trigger_pattern_cache = None  # инвалидируем кэш при каждом сохранении
         try:
             sh = self._gs.open_by_key(self._spreadsheet_id)
             try:
@@ -82,6 +87,7 @@ class ConfigManager:
             log.info("Конфиг сохранён")
         except Exception as e:
             log.error("Не удалось сохранить конфиг: %s", e)
+            raise  # FIX #2: пробрасываем дальше — молча не теряем данные
 
     # ── Свойства ───────────────────────────────────────────────────────────
 
@@ -106,7 +112,10 @@ class ConfigManager:
         return self._cfg.get("routes", {})
 
     def trigger_pattern(self) -> str:
-        return "|".join(re.escape(t) for t in self.triggers)
+        # FIX #16: кэшируем паттерн — не пересобираем на каждое сообщение
+        if self._trigger_pattern_cache is None:
+            self._trigger_pattern_cache = "|".join(re.escape(t) for t in self.triggers)
+        return self._trigger_pattern_cache
 
     def detect_sheet(self, text: str, default: str) -> str:
         """Возвращает название листа по ключевым словам в тексте."""

@@ -130,8 +130,16 @@ class SheetsClient:
             hdrs = headers if headers is not None else self.config.headers
             ws.update("A1", [hdrs])
             ws.format("A1:Z1", {"textFormat": {"bold": True}})
+            # FIX #7: инвалидируем старый кэш и сохраняем свежий объект
             self._ws_cache[sheet_name] = ws
             return True
+
+    def invalidate_cache(self, sheet_name: str | None = None) -> None:
+        """Сбрасывает кэш воркшита. Без аргументов — весь кэш."""
+        if sheet_name:
+            self._ws_cache.pop(sheet_name, None)
+        else:
+            self._ws_cache.clear()
 
     def _get_or_create_col(self, ws: gspread.Worksheet,
                            headers: list[str], name: str) -> int:
@@ -158,8 +166,8 @@ class SheetsClient:
         # Строим словарь метка → значение из полного row
         value_map: dict[str, Any] = dict(zip(config_headers, row))
 
-        all_values = ws.get_all_values()
-        next_row = len(all_values) + 1
+        # FIX #5: col_values(1) читает только первую колонку вместо всех данных
+        next_row = len(ws.col_values(1)) + 1
 
         # Только те колонки, которые есть на этом листе
         cells = [

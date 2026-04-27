@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from typing import Any
 
@@ -41,9 +42,16 @@ from config_manager import ConfigManager
 from parser import ExpenseParser, format_preview
 from sheets import SheetsClient, create_new_spreadsheet, _build_gs_client
 
+from logging.handlers import RotatingFileHandler as _RotatingFileHandler
+
+# FIX #9: ротация логов — максимум 5 MB × 3 файла
+_log_handler = _RotatingFileHandler(
+    "bot.log", maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
+    handlers=[_log_handler, logging.StreamHandler()],
 )
 log = logging.getLogger("bot")
 
@@ -229,7 +237,12 @@ async def cmd_addcol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("Укажи название колонки.")
         return
     cfg: ConfigManager = context.bot_data["config"]
-    if cfg.add_field(label, ftype):
+    try:
+        added = cfg.add_field(label, ftype)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Не удалось сохранить: {html.escape(str(e))}")
+        return
+    if added:
         await update.message.reply_text(f"✅ Колонка <b>{label}</b> добавлена.", parse_mode=ParseMode.HTML)
     else:
         await update.message.reply_text(f"Колонка <b>{label}</b> уже есть.", parse_mode=ParseMode.HTML)
@@ -244,7 +257,11 @@ async def cmd_removecol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     label = " ".join(args)
     cfg: ConfigManager = context.bot_data["config"]
-    result = cfg.remove_field(label)
+    try:
+        result = cfg.remove_field(label)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Не удалось сохранить: {html.escape(str(e))}")
+        return
     if result == "ok":
         await update.message.reply_text(f"✅ Колонка <b>{label}</b> убрана из отчётов.", parse_mode=ParseMode.HTML)
     elif result == "protected":
@@ -265,7 +282,11 @@ async def cmd_addalias(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     word = args[0]
     target = " ".join(args[1:]).strip('"\'')
-    context.bot_data["config"].add_alias(word, target)
+    try:
+        context.bot_data["config"].add_alias(word, target)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Не удалось сохранить: {html.escape(str(e))}")
+        return
     await update.message.reply_text(
         f'✅ Алиас добавлен: <b>{word}</b> → <b>{target}</b>', parse_mode=ParseMode.HTML)
 
@@ -278,7 +299,12 @@ async def cmd_removealias(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("Использование: /removealias слово")
         return
     word = args[0]
-    if context.bot_data["config"].remove_alias(word):
+    try:
+        found = context.bot_data["config"].remove_alias(word)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Не удалось сохранить: {html.escape(str(e))}")
+        return
+    if found:
         await update.message.reply_text(f"✅ Алиас <b>{word}</b> удалён.", parse_mode=ParseMode.HTML)
     else:
         await update.message.reply_text(f"Алиас <b>{word}</b> не найден.")
@@ -325,7 +351,6 @@ def _cols_text_and_kb(cfg: ConfigManager) -> tuple[str, InlineKeyboardMarkup]:
 
 def _routes_text_and_kb(cfg: ConfigManager) -> tuple[str, InlineKeyboardMarkup]:
     routes = cfg.routes
-    keys = list(routes.keys())
     if routes:
         lines = ["🔀 <b>Маршруты:</b>\n"]
         rows: list[list[InlineKeyboardButton]] = []
@@ -528,7 +553,16 @@ async def cmd_newsheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not args:
         await update.message.reply_text("Использование: /newsheet Название")
         return
-    name = " ".join(args)
+    name = " ".join(args).strip()
+    # FIX #10: Google Sheets ограничивает имя листа 100 символами
+    if not name:
+        await update.message.reply_text("❌ Название не может быть пустым.")
+        return
+    if len(name) > 100:
+        await update.message.reply_text(
+            f"❌ Название слишком длинное ({len(name)} символов). Максимум — 100."
+        )
+        return
     cfg: ConfigManager = context.bot_data["config"]
     user_id = update.effective_user.id
 
@@ -537,6 +571,7 @@ async def cmd_newsheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "name": name,
         "selected": {f["label"] for f in cfg.fields},
         "new_cols": [],   # новые столбцы добавленные прямо здесь
+        "ts": time.time(),  # FIX #4/#21: для TTL-очистки
     }
 
     await update.message.reply_text(
@@ -556,7 +591,11 @@ async def cmd_addroute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     keyword = args[0]
     sheet_name = " ".join(args[1:])
-    context.bot_data["config"].add_route(keyword, sheet_name)
+    try:
+        context.bot_data["config"].add_route(keyword, sheet_name)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Не удалось сохранить: {html.escape(str(e))}")
+        return
     await update.message.reply_text(
         f'✅ Маршрут: сообщения с «<b>{keyword}</b>» → лист <b>{sheet_name}</b>',
         parse_mode=ParseMode.HTML)
@@ -718,7 +757,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     token = uuid.uuid4().hex[:12]
-    PENDING[token] = {"data": parsed, "sheet": sheet_name}
+    # FIX #4: сохраняем время создания для TTL-очистки
+    PENDING[token] = {"data": parsed, "sheet": sheet_name, "ts": time.time()}
 
     sheet_label = f" → <b>{sheet_name}</b>" if sheet_name != sheets.sheet_name else ""
     preview = format_preview(parsed, cfg.fields)
@@ -1080,6 +1120,25 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("Handler error", exc_info=context.error)
 
 
+# FIX #4: периодическая очистка протухших сессий (TTL = 1 час)
+async def cleanup_stale_sessions(context: ContextTypes.DEFAULT_TYPE) -> None:
+    cutoff = time.time() - 3600
+    expired_tokens = [t for t, v in PENDING.items() if v.get("ts", 0) < cutoff]
+    for t in expired_tokens:
+        PENDING.pop(t, None)
+    stale_users = [u for u, t in EDIT_WAITING.items() if t not in PENDING]
+    for u in stale_users:
+        EDIT_WAITING.pop(u, None)
+    stale_ns = [u for u, v in NEW_SHEET_PENDING.items()
+                if time.time() - v.get("ts", time.time()) > 1800]
+    for u in stale_ns:
+        NEW_SHEET_PENDING.pop(u, None)
+        SETTINGS_WAITING.pop(u, None)
+    if expired_tokens or stale_users or stale_ns:
+        log.info("Очистка сессий: PENDING-%d EDIT-%d NS-%d",
+                 len(expired_tokens), len(stale_users), len(stale_ns))
+
+
 # ── Bootstrap ──────────────────────────────────────────────────────────────
 
 def _try_save_spreadsheet_id_to_railway(spreadsheet_id: str) -> None:
@@ -1121,8 +1180,18 @@ def build_app() -> Application:
     owner_email   = os.environ.get("SPREADSHEET_OWNER_EMAIL", "").strip()
     spreadsheet_id = os.environ.get("SPREADSHEET_ID", "").strip()
 
-    # Авторизация Google один раз — переиспользуем клиент везде
-    gs_client = _build_gs_client(creds_path)
+    # FIX #3: понятная ошибка при отсутствии credentials
+    try:
+        gs_client = _build_gs_client(creds_path)
+    except FileNotFoundError as e:
+        log.critical(
+            "❌ Google credentials не найдены: %s\n"
+            "Задайте GOOGLE_CREDENTIALS_JSON или положите credentials.json рядом с bot.py", e
+        )
+        raise SystemExit(1) from e
+    except Exception as e:
+        log.critical("❌ Ошибка авторизации Google: %s", e)
+        raise SystemExit(1) from e
 
     # Автосоздание таблицы если SPREADSHEET_ID не задан
     spreadsheet_url = ""
@@ -1184,6 +1253,9 @@ def build_app() -> Application:
         "spreadsheet_url": spreadsheet_url,
         "service_account_email": sa_email,
     })
+
+    # FIX #4: очищаем протухшие сессии каждые 30 минут
+    app.job_queue.run_repeating(cleanup_stale_sessions, interval=1800, first=1800)
 
     app.add_handler(CommandHandler("menu",        cmd_menu))
     app.add_handler(CommandHandler("sheet",       cmd_sheet))

@@ -6,10 +6,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import time
 from datetime import date, datetime
 from typing import Any, TYPE_CHECKING
 
-from groq import Groq
+from groq import Groq, RateLimitError
 
 if TYPE_CHECKING:
     from config_manager import ConfigManager
@@ -57,7 +59,7 @@ def _build_system_prompt(fields: list[dict]) -> str:
 
     lines += [
         '- extra_expenses: доп. расходы не попавшие ни в одно поле выше.',
-        '  Формат: [{\"name\": \"Название\", \"amount\": число}]. Если нет — [].',
+        '  Формат: [{"name": "Название", "amount": число}]. Если нет — [].',
         "",
         "Правила:",
         "1. Отвечай ТОЛЬКО валидным JSON без markdown.",
@@ -78,12 +80,18 @@ def _normalize(raw: dict[str, Any], fields: list[dict]) -> dict[str, Any]:
             if not d or not isinstance(d, str):
                 d = _today_iso()
             else:
+                # FIX #1: если ни один формат не сработал — fallback к today
+                parsed_ok = False
                 for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%d-%m-%Y"):
                     try:
                         d = datetime.strptime(d, fmt).date().isoformat()
+                        parsed_ok = True
                         break
                     except ValueError:
                         continue
+                if not parsed_ok:
+                    log.warning("Не удалось распознать дату %r — использую сегодня", d)
+                    d = _today_iso()
             out[key] = d
         elif ftype == "text":
             out[key] = str(raw.get(key, "") or "").strip()
@@ -98,7 +106,16 @@ def _normalize(raw: dict[str, Any], fields: list[dict]) -> dict[str, Any]:
             name = str(item["name"]).strip()
             name = name[0].upper() + name[1:] if name else name
             cleaned.append({"name": name, "amount": _coerce_number(item.get("amount", 0))})
-    out["extra_expenses"] = cleaned
+
+    # FIX #8: схлопываем дубли extra_expenses (суммируем одинаковые name)
+    seen: dict[str, dict] = {}
+    for item in cleaned:
+        name = item["name"]
+        if name in seen:
+            seen[name]["amount"] += item["amount"]
+        else:
+            seen[name] = dict(item)
+    out["extra_expenses"] = list(seen.values())
     return out
 
 
@@ -108,33 +125,51 @@ def format_preview(parsed: dict[str, Any], fields: list[dict]) -> str:
     if extra:
         lines.append("\n*Доп. расходы:*")
         for item in extra:
-            lines.append(f"  • {item['name']}: {item['amount']:,}")
+            # FIX #12: пробел вместо запятой как разделитель тысяч
+            amount_str = f"{item['amount']:,}".replace(",", " ")
+            lines.append(f"  • {item['name']}: {amount_str}")
     return "\n".join(lines)
 
 
 class ExpenseParser:
     def __init__(self, api_key: str, config: "ConfigManager",
-                 model: str = "llama-3.3-70b-versatile"):
-        self.client = Groq(api_key=api_key)
-        self.model = model
+                 model: str | None = None):
+        # FIX #11: timeout 30 сек; FIX #15: модель из env-переменной
+        self.client = Groq(api_key=api_key, timeout=30.0)
+        self.model = model or os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
         self.config = config
 
-    def _call_llm(self, text: str) -> dict[str, Any]:
+    def _call_llm(self, text: str, retries: int = 2) -> dict[str, Any]:
+        """FIX #6: retry при rate-limit с экспоненциальной задержкой."""
         prompt = _build_system_prompt(self.config.fields)
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user",   "content": text},
-            ],
-            temperature=0,
-            response_format={"type": "json_object"},
-        )
-        content = resp.choices[0].message.content or "{}"
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Модель вернула невалидный JSON: {e}") from e
+        last_err: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": prompt},
+                        {"role": "user",   "content": text},
+                    ],
+                    temperature=0,
+                    response_format={"type": "json_object"},
+                )
+                content = resp.choices[0].message.content or "{}"
+                try:
+                    return json.loads(content)
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"Модель вернула невалидный JSON: {e}") from e
+            except RateLimitError as e:
+                last_err = e
+                if attempt < retries:
+                    wait = 5 * (attempt + 1)
+                    log.warning("Groq rate-limit (попытка %d/%d), жду %dс…", attempt + 1, retries + 1, wait)
+                    time.sleep(wait)
+                else:
+                    raise ValueError("Groq перегружен, попробуй через минуту.") from e
+            except Exception:
+                raise
+        raise last_err  # type: ignore[misc]
 
     def parse(self, text: str) -> dict[str, Any]:
         text = self.config.apply_aliases(text)
