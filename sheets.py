@@ -218,10 +218,9 @@ class SheetsClient:
         return new_col
 
     def append_row(self, row: list[Any],
-                   extra_expenses: list[dict] | None = None,
                    sheet_name: str | None = None) -> int:
         """Добавляет строку, сопоставляя значения по названию колонки.
-        Работает корректно даже если у листа нестандартный набор столбцов."""
+        Доп. расходы хранятся в текстовом поле extras_text внутри row."""
         target = sheet_name or self.sheet_name
         self.ensure_headers(target)
         ws = self._get_ws(target)
@@ -240,15 +239,6 @@ class SheetsClient:
             for col_idx, hdr in enumerate(sheet_headers)
             if hdr in value_map
         ]
-
-        # Доп. расходы (динамические колонки)
-        for item in (extra_expenses or []):
-            name = item.get("name", "").strip()
-            amount = item.get("amount", 0)
-            if not name:
-                continue
-            col = self._get_or_create_col(ws, sheet_headers, name)
-            cells.append(gspread.Cell(next_row, col, amount))
 
         ws.update_cells(cells, value_input_option="USER_ENTERED")
         return next_row

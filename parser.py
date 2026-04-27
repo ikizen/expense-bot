@@ -107,7 +107,7 @@ def _normalize(raw: dict[str, Any], fields: list[dict]) -> dict[str, Any]:
             name = name[0].upper() + name[1:] if name else name
             cleaned.append({"name": name, "amount": _coerce_number(item.get("amount", 0))})
 
-    # FIX #8: схлопываем дубли extra_expenses (суммируем одинаковые name)
+    # Схлопываем дубли extra_expenses (суммируем одинаковые name)
     seen: dict[str, dict] = {}
     for item in cleaned:
         name = item["name"]
@@ -116,16 +116,34 @@ def _normalize(raw: dict[str, Any], fields: list[dict]) -> dict[str, Any]:
         else:
             seen[name] = dict(item)
     out["extra_expenses"] = list(seen.values())
+
+    # Текстовое поле для таблицы — "Сирень: 28 000; Алиса: 18 000"
+    out["extras_text"] = _extras_to_text(out["extra_expenses"])
     return out
 
 
+def _extras_to_text(extras: list[dict]) -> str:
+    """Форматирует доп. расходы в одну строку для ячейки таблицы."""
+    if not extras:
+        return ""
+    parts = []
+    for item in extras:
+        amount_str = f"{item['amount']:,}".replace(",", " ")
+        parts.append(f"{item['name']}: {amount_str}")
+    return "; ".join(parts)
+
+
 def format_preview(parsed: dict[str, Any], fields: list[dict]) -> str:
-    lines = [f"*{f['label']}:* {parsed.get(f['key'], '')}" for f in fields]
+    # Показываем поля конфига, кроме extras_text (он выводится отдельно)
+    lines = [
+        f"*{f['label']}:* {parsed.get(f['key'], '')}"
+        for f in fields
+        if f["key"] != "extras_text"
+    ]
     extra = parsed.get("extra_expenses", [])
     if extra:
         lines.append("\n*Доп. расходы:*")
         for item in extra:
-            # FIX #12: пробел вместо запятой как разделитель тысяч
             amount_str = f"{item['amount']:,}".replace(",", " ")
             lines.append(f"  • {item['name']}: {amount_str}")
     return "\n".join(lines)
@@ -199,6 +217,9 @@ class ExpenseParser:
             for item in correction_extra:
                 existing[item["name"]] = item
             merged["extra_expenses"] = list(existing.values())
+
+        # Обновляем текстовое поле вслед за изменёнными extra_expenses
+        merged["extras_text"] = _extras_to_text(merged.get("extra_expenses", []))
         return merged
 
     def row_for_sheet(self, parsed: dict[str, Any]) -> list[Any]:
