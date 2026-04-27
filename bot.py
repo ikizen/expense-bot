@@ -305,13 +305,13 @@ def _settings_main_kb() -> InlineKeyboardMarkup:
 def _cols_text_and_kb(cfg: ConfigManager) -> tuple[str, InlineKeyboardMarkup]:
     lines = [f"📋 <b>Колонки ({len(cfg.fields)}):</b>\n"]
     rows: list[list[InlineKeyboardButton]] = []
-    for f in cfg.fields:
+    for i, f in enumerate(cfg.fields):
         protected = f["key"] in {"date", "kassir"}
         lock = " 🔒" if protected else ""
         lines.append(f"  • {f['label']} ({f['type']}){lock}")
         if not protected:
             rows.append([InlineKeyboardButton(
-                f"➖ {f['label']}", callback_data=f"m_cdel:{f['key']}",
+                f"➖ {f['label']}", callback_data=f"m_cdel:{i}",  # индекс, не ключ
             )])
     rows += [
         [
@@ -325,13 +325,14 @@ def _cols_text_and_kb(cfg: ConfigManager) -> tuple[str, InlineKeyboardMarkup]:
 
 def _routes_text_and_kb(cfg: ConfigManager) -> tuple[str, InlineKeyboardMarkup]:
     routes = cfg.routes
+    keys = list(routes.keys())
     if routes:
         lines = ["🔀 <b>Маршруты:</b>\n"]
         rows: list[list[InlineKeyboardButton]] = []
-        for kw, sheet in routes.items():
+        for i, (kw, sheet) in enumerate(routes.items()):
             lines.append(f"  • «{kw}» → <b>{html.escape(sheet)}</b>")
             rows.append([InlineKeyboardButton(
-                f"➖ «{kw}»", callback_data=f"m_rdel:{kw[:28]}",
+                f"➖ «{kw}»", callback_data=f"m_rdel:{i}",  # индекс
             )])
     else:
         lines = ["🔀 <b>Маршруты:</b>\n", "  Пусто — все идёт на основной лист."]
@@ -348,10 +349,10 @@ def _aliases_text_and_kb(cfg: ConfigManager) -> tuple[str, InlineKeyboardMarkup]
     if aliases:
         lines = ["💬 <b>Алиасы:</b>\n"]
         rows: list[list[InlineKeyboardButton]] = []
-        for word, target in aliases.items():
+        for i, (word, target) in enumerate(aliases.items()):
             lines.append(f"  • {word} → {target}")
             rows.append([InlineKeyboardButton(
-                f"➖ {word}", callback_data=f"m_adel:{word[:30]}",
+                f"➖ {word}", callback_data=f"m_adel:{i}",  # индекс
             )])
     else:
         lines = ["💬 <b>Алиасы:</b>\n", "  Пусто."]
@@ -484,12 +485,12 @@ def _newsheet_keyboard(user_id: int, cfg: ConfigManager) -> InlineKeyboardMarkup
     # Существующие поля — по 2 в ряд
     rows: list[list[InlineKeyboardButton]] = []
     pair: list[InlineKeyboardButton] = []
-    for f in fields:
+    for i, f in enumerate(fields):
         label = f["label"]
         mark = "✅" if label in selected else "☐"
         btn = InlineKeyboardButton(
             f"{mark} {label}",
-            callback_data=f"nst:{user_id}:{f['key']}",
+            callback_data=f"nst:{user_id}:{i}",  # индекс, не ключ
         )
         pair.append(btn)
         if len(pair) == 2:
@@ -777,14 +778,14 @@ async def _handle_callback_inner(query, data: str, cfg: "ConfigManager",
 
     # ── Мастер создания нового листа ──────────────────────────────────────
     if data.startswith("nst:"):        # toggle столбца
-        _, uid_str, fkey = data.split(":", 2)
+        _, uid_str, idx_str = data.split(":", 2)
         uid = int(uid_str)
         if uid not in NEW_SHEET_PENDING:
             await query.edit_message_text("Сессия истекла. Запусти /newsheet заново.")
             return
         state = NEW_SHEET_PENDING[uid]
-        # Находим метку по ключу
-        label = next((f["label"] for f in cfg.fields if f["key"] == fkey), None)
+        idx = int(idx_str)
+        label = cfg.fields[idx]["label"] if idx < len(cfg.fields) else None
         if label:
             if label in state["selected"]:
                 state["selected"].discard(label)
@@ -913,9 +914,9 @@ async def _handle_callback_inner(query, data: str, cfg: "ConfigManager",
             await query.edit_message_text(t, reply_markup=kb, parse_mode=ParseMode.HTML)
 
         elif data.startswith("m_cdel:"):
-            fkey = data[7:]
-            label = next((f["label"] for f in cfg.fields if f["key"] == fkey), fkey)
-            result = cfg.remove_field(label)
+            idx = int(data[7:])
+            label = cfg.fields[idx]["label"] if idx < len(cfg.fields) else ""
+            result = cfg.remove_field(label) if label else "not_found"
             t, kb = _cols_text_and_kb(cfg)
             suffix = f"\n\n✅ Удалена: <b>{html.escape(label)}</b>" if result == "ok" else ""
             await query.edit_message_text(t + suffix, reply_markup=kb, parse_mode=ParseMode.HTML)
@@ -947,13 +948,14 @@ async def _handle_callback_inner(query, data: str, cfg: "ConfigManager",
             await query.edit_message_text(t, reply_markup=kb, parse_mode=ParseMode.HTML)
 
         elif data.startswith("m_rdel:"):
-            kw = data[7:]
-            cfg.remove_route(kw)
+            idx = int(data[7:])
+            keys = list(cfg.routes.keys())
+            kw = keys[idx] if idx < len(keys) else ""
+            if kw:
+                cfg.remove_route(kw)
             t, kb = _routes_text_and_kb(cfg)
-            await query.edit_message_text(
-                t + f"\n\n✅ Маршрут «{html.escape(kw)}» удалён.",
-                reply_markup=kb, parse_mode=ParseMode.HTML,
-            )
+            suffix = f"\n\n✅ Маршрут «{html.escape(kw)}» удалён." if kw else ""
+            await query.edit_message_text(t + suffix, reply_markup=kb, parse_mode=ParseMode.HTML)
 
         elif data == "m_radd":
             SETTINGS_WAITING[uid] = {
@@ -981,13 +983,14 @@ async def _handle_callback_inner(query, data: str, cfg: "ConfigManager",
             await query.edit_message_text(t, reply_markup=kb, parse_mode=ParseMode.HTML)
 
         elif data.startswith("m_adel:"):
-            word = data[7:]
-            cfg.remove_alias(word)
+            idx = int(data[7:])
+            words = list(cfg.aliases.keys())
+            word = words[idx] if idx < len(words) else ""
+            if word:
+                cfg.remove_alias(word)
             t, kb = _aliases_text_and_kb(cfg)
-            await query.edit_message_text(
-                t + f"\n\n✅ Алиас «{html.escape(word)}» удалён.",
-                reply_markup=kb, parse_mode=ParseMode.HTML,
-            )
+            suffix = f"\n\n✅ Алиас «{html.escape(word)}» удалён." if word else ""
+            await query.edit_message_text(t + suffix, reply_markup=kb, parse_mode=ParseMode.HTML)
 
         elif data == "m_aadd":
             SETTINGS_WAITING[uid] = {
