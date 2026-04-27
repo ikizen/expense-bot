@@ -24,6 +24,9 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
+# Минимальный запас колонок сверх нужных — чтобы лист не кончался
+_COL_BUFFER = 20
+
 
 def create_new_spreadsheet(
     gs_client: gspread.Client,
@@ -31,10 +34,6 @@ def create_new_spreadsheet(
     folder_id: str | None = None,
     share_email: str | None = None,
 ) -> tuple[str, str]:
-    """
-    Создаёт новую Google Таблицу напрямую в указанной папке Drive.
-    Возвращает (spreadsheet_id, url).
-    """
     creds = gs_client.auth
     if not creds.valid:
         creds.refresh(Request())
@@ -96,32 +95,65 @@ class SheetsClient:
         self.config = config
         self._ws_cache: dict[str, gspread.Worksheet] = {}
 
-    # ── Внутренние хелперы ────────────────────────────────────────────────
+    # ── Получение листа ───────────────────────────────────────────────────
 
     def _get_ws(self, sheet_name: str) -> gspread.Worksheet:
+        """Возвращает объект листа. Кэш используется только для быстрых операций записи."""
         if sheet_name not in self._ws_cache:
             sh = self.client.open_by_key(self.spreadsheet_id)
             try:
                 ws = sh.worksheet(sheet_name)
             except gspread.WorksheetNotFound:
                 log.info("Лист '%s' не найден — создаю.", sheet_name)
-                ws = sh.add_worksheet(title=sheet_name, rows=1000, cols=30)
+                # Создаём сразу с запасом колонок
+                ws = sh.add_worksheet(
+                    title=sheet_name, rows=1000,
+                    cols=len(self.config.headers) + _COL_BUFFER,
+                )
             self._ws_cache[sheet_name] = ws
         return self._ws_cache[sheet_name]
 
-    def _fresh_ws(self, sheet_name: str) -> gspread.Worksheet:
-        """Возвращает свежий объект листа (не из кэша). Обновляет кэш."""
-        self._ws_cache.pop(sheet_name, None)
-        return self._get_ws(sheet_name)
+    def _api_ws(self, sheet_name: str) -> tuple[gspread.Spreadsheet, gspread.Worksheet]:
+        """Всегда делает свежий запрос к API. Возвращает (spreadsheet, worksheet).
+        Создаёт лист если не существует. Использовать перед resize/write заголовков."""
+        sh = self.client.open_by_key(self.spreadsheet_id)
+        try:
+            ws = sh.worksheet(sheet_name)
+        except gspread.WorksheetNotFound:
+            log.info("Лист '%s' не найден — создаю.", sheet_name)
+            ws = sh.add_worksheet(
+                title=sheet_name, rows=1000,
+                cols=len(self.config.headers) + _COL_BUFFER,
+            )
+        return sh, ws
+
+    def _expand_cols(self, sh: gspread.Spreadsheet,
+                     ws: gspread.Worksheet, needed: int) -> gspread.Worksheet:
+        """Расширяет лист до needed+_COL_BUFFER колонок если нужно.
+        Никогда не уменьшает. Возвращает свежий ws после resize."""
+        target = needed + _COL_BUFFER
+        if ws.col_count < target:
+            ws.resize(rows=ws.row_count, cols=target)
+            log.info("Лист '%s' расширен до %d колонок", ws.title, target)
+            # Получаем свежий объект с актуальным col_count после resize
+            ws = sh.worksheet(ws.title)
+        return ws
+
+    def invalidate_cache(self, sheet_name: str | None = None) -> None:
+        if sheet_name:
+            self._ws_cache.pop(sheet_name, None)
+        else:
+            self._ws_cache.clear()
 
     # ── Заголовки ─────────────────────────────────────────────────────────
 
     def ensure_headers(self, sheet_name: str | None = None) -> None:
-        """Дозаписывает в строку 1 заголовки которых ещё нет. Не-фатально."""
+        """Добавляет недостающие заголовки в строку 1. Расширяет лист если нужно.
+        Не-фатально — ошибка заголовков не прерывает запись данных."""
         name = sheet_name or self.sheet_name
         try:
-            # Всегда берём свежий объект — col_count в кэше может быть устаревшим
-            ws = self._fresh_ws(name)
+            # Всегда свежий запрос к API — col_count из кэша ненадёжен
+            sh, ws = self._api_ws(name)
             existing = ws.row_values(1)
             want = self.config.headers
 
@@ -131,26 +163,26 @@ class SheetsClient:
                 existing_set = set(h for h in existing if h)
                 missing = [h for h in want if h not in existing_set]
                 if not missing:
+                    # Заголовки уже на месте — обновляем кэш свежим объектом
+                    self._ws_cache[name] = ws
                     return
                 new_vals = list(existing) + missing
 
-            # Расширяем лист если нужно (снова свежий объект после resize)
-            if ws.col_count < len(new_vals):
-                ws.resize(rows=ws.row_count, cols=len(new_vals) + 10)
-                ws = self._fresh_ws(name)
+            # Расширяем лист (если нужно) и получаем свежий ws
+            ws = self._expand_cols(sh, ws, len(new_vals))
 
             ws.update("A1", [new_vals], value_input_option="RAW")
-            self._ws_cache.pop(name, None)
-            log.info("ensure_headers '%s': %d колонок", name, len(new_vals))
+            self._ws_cache[name] = ws
+            log.info("ensure_headers '%s': итого %d колонок", name, len(new_vals))
         except Exception as e:
-            log.error("ensure_headers '%s' failed: %s", name, e)
-            # Не прерываем запись — данные важнее заголовков
+            log.error("ensure_headers '%s' не удалось: %s", name, e)
+            self._ws_cache.pop(name, None)  # сбрасываем кэш при ошибке
 
     def sync_headers(self, sheet_name: str | None = None) -> dict:
-        """Перезаписывает строку 1 ровно под текущий конфиг.
-        Возвращает {"kept": [...], "cleared": [...], "added": [...]}."""
+        """Перезаписывает строку 1 точно под текущий конфиг (убирает старые колонки).
+        Возвращает {"kept", "cleared", "added"}."""
         name = sheet_name or self.sheet_name
-        ws = self._fresh_ws(name)
+        sh, ws = self._api_ws(name)
         want = self.config.headers
         have = ws.row_values(1)
 
@@ -160,48 +192,47 @@ class SheetsClient:
         cleared = [h for h in have if h and h not in want_set]
         added   = [h for h in want if h not in have_set]
 
+        # Строка 1: нужные заголовки + пустые ячейки поверх старых лишних
         n = max(len(have), len(want))
         new_row = (want + [""] * n)[:n]
 
-        if ws.col_count < len(new_row):
-            ws.resize(rows=ws.row_count, cols=len(new_row) + 10)
-            ws = self._fresh_ws(name)
-
+        ws = self._expand_cols(sh, ws, n)
         ws.update("A1", [new_row], value_input_option="RAW")
         self._ws_cache.pop(name, None)
+
         log.info("sync_headers '%s': kept=%d cleared=%d added=%d",
                  name, len(kept), len(cleared), len(added))
         return {"kept": kept, "cleared": cleared, "added": added}
 
     def create_sheet(self, sheet_name: str,
                      headers: list[str] | None = None) -> bool:
-        """Создаёт новый лист. Возвращает False если уже существует."""
+        """Создаёт новый лист с заданными заголовками.
+        Возвращает False если лист уже существует."""
         sh = self.client.open_by_key(self.spreadsheet_id)
         try:
             sh.worksheet(sheet_name)
             return False
         except gspread.WorksheetNotFound:
             hdrs = headers if headers is not None else self.config.headers
-            ws = sh.add_worksheet(title=sheet_name, rows=1000, cols=len(hdrs) + 10)
+            ws = sh.add_worksheet(
+                title=sheet_name, rows=1000,
+                cols=len(hdrs) + _COL_BUFFER,
+            )
             ws.update("A1", [hdrs], value_input_option="RAW")
             self._ws_cache[sheet_name] = ws
             return True
 
-    def invalidate_cache(self, sheet_name: str | None = None) -> None:
-        if sheet_name:
-            self._ws_cache.pop(sheet_name, None)
-        else:
-            self._ws_cache.clear()
+    # ── Запись строки ─────────────────────────────────────────────────────
 
     def append_row(self, row: list[Any],
                    sheet_name: str | None = None) -> int:
-        """Добавляет строку, сопоставляя значения по названию колонки."""
+        """Добавляет строку данных. Перед записью проверяет/дополняет заголовки."""
         target = sheet_name or self.sheet_name
         self.ensure_headers(target)
+
         ws = self._get_ws(target)
         sheet_headers = ws.row_values(1)
         config_headers = self.config.headers
-
         value_map: dict[str, Any] = dict(zip(config_headers, row))
 
         next_row = len(ws.col_values(1)) + 1
