@@ -1141,8 +1141,9 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("Handler error", exc_info=context.error)
 
 
-# FIX #4: периодическая очистка протухших сессий (TTL = 1 час)
-async def cleanup_stale_sessions(context: ContextTypes.DEFAULT_TYPE) -> None:
+# FIX #4: периодическая очистка протухших сессий без job-queue
+def _do_cleanup() -> None:
+    """Синхронная очистка — вызывается из async loop каждые 30 мин."""
     cutoff = time.time() - 3600
     expired_tokens = [t for t, v in PENDING.items() if v.get("ts", 0) < cutoff]
     for t in expired_tokens:
@@ -1158,6 +1159,13 @@ async def cleanup_stale_sessions(context: ContextTypes.DEFAULT_TYPE) -> None:
     if expired_tokens or stale_users or stale_ns:
         log.info("Очистка сессий: PENDING-%d EDIT-%d NS-%d",
                  len(expired_tokens), len(stale_users), len(stale_ns))
+
+
+async def _cleanup_loop() -> None:
+    """Фоновая задача: чистим каждые 30 минут."""
+    while True:
+        await asyncio.sleep(1800)
+        _do_cleanup()
 
 
 # ── Bootstrap ──────────────────────────────────────────────────────────────
@@ -1275,8 +1283,11 @@ def build_app() -> Application:
         "service_account_email": sa_email,
     })
 
-    # FIX #4: очищаем протухшие сессии каждые 30 минут
-    app.job_queue.run_repeating(cleanup_stale_sessions, interval=1800, first=1800)
+    # FIX #4: фоновая очистка через asyncio (без job-queue зависимости)
+    async def _post_init(application: Application) -> None:
+        asyncio.get_event_loop().create_task(_cleanup_loop())
+
+    app.post_init = _post_init
 
     app.add_handler(CommandHandler("resetconfig",  cmd_resetconfig))
     app.add_handler(CommandHandler("menu",        cmd_menu))
