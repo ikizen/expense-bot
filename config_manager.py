@@ -16,28 +16,44 @@ log = logging.getLogger(__name__)
 CONFIG_SHEET = "_config"
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "version": 1,
+    "version": 2,
     "fields": [
-        {"key": "date",               "label": "Дата",                "type": "date"},
-        {"key": "kaspi",              "label": "Каспи",               "type": "number"},
-        {"key": "nalichka",           "label": "Наличка",             "type": "number"},
-        {"key": "halyk",              "label": "Халык",               "type": "number"},
-        {"key": "perevod",            "label": "Перевод",             "type": "number"},
-        {"key": "kassir",             "label": "Кассир",              "type": "text"},
-        {"key": "leads_instagram",    "label": "Инстаграм",           "type": "number"},
-        {"key": "leads_whatsapp",     "label": "Ватсап",              "type": "number"},
-        {"key": "leads_whatsapp_ads", "label": "Ватсап реклама",      "type": "number"},
-        {"key": "leads_offline",      "label": "Офлайн лиды",         "type": "number"},
-        {"key": "leads_regular",      "label": "Постоянные клиенты",  "type": "number"},
-        {"key": "sales_online",       "label": "Продажи онлайн",      "type": "number"},
-        {"key": "sales_offline",      "label": "Продажи оффлайн",     "type": "number"},
-        {"key": "couriers",           "label": "Курьеры",             "type": "number"},
-        {"key": "purchases",          "label": "Закуп",               "type": "number"},
-        {"key": "other_expenses",     "label": "Прочие расходы",      "type": "number"},
+        # ── Обязательные ──────────────────────────────────────────────────
+        {"key": "date",                 "label": "Дата",                        "type": "date"},
+        {"key": "kassir",               "label": "Флорист",                     "type": "text"},
+        # ── Оплата ────────────────────────────────────────────────────────
+        {"key": "nalichka",             "label": "Наличные",                    "type": "number"},
+        {"key": "kaspi",                "label": "Kaspi",                       "type": "number"},
+        {"key": "halyk",                "label": "Halyk",                       "type": "number"},
+        {"key": "perevod",              "label": "Перевод",                     "type": "number"},
+        {"key": "inostr_valuta",        "label": "Иностранная валюта",          "type": "number"},
+        # ── Онлайн ────────────────────────────────────────────────────────
+        {"key": "online_zayavki",       "label": "Онлайн-заявки",              "type": "number"},
+        {"key": "online_prodazhi",      "label": "Онлайн-продажи",             "type": "number"},
+        {"key": "post_online_zayavki",  "label": "Постоянные онлайн-заявки",   "type": "number"},
+        {"key": "post_online_prodazhi", "label": "Постоянные онлайн-продажи",  "type": "number"},
+        {"key": "new_online_zayavki",   "label": "Новые онлайн-заявки",        "type": "number"},
+        {"key": "new_online_prodazhi",  "label": "Новые онлайн-продажи",       "type": "number"},
+        # ── WhatsApp ──────────────────────────────────────────────────────
+        {"key": "whatsapp_zayavki",     "label": "Заявки WhatsApp",            "type": "number"},
+        {"key": "whatsapp_prodazhi",    "label": "Продажи WhatsApp",           "type": "number"},
+        # ── Instagram ─────────────────────────────────────────────────────
+        {"key": "instagram_zayavki",    "label": "Заявки Instagram",           "type": "number"},
+        {"key": "instagram_prodazhi",   "label": "Продажи Instagram",          "type": "number"},
+        # ── Офлайн ────────────────────────────────────────────────────────
+        {"key": "offline_zayavki",      "label": "Офлайн-заявки",              "type": "number"},
+        {"key": "offline_prodazhi",     "label": "Офлайн-продажи",             "type": "number"},
+        # ── Финансы ───────────────────────────────────────────────────────
+        {"key": "nalichka_nachalo",     "label": "Наличные на начало дня",     "type": "number"},
+        {"key": "dostavka",             "label": "Доставка",                   "type": "number"},
+        {"key": "zarplata",             "label": "Заработная плата",           "type": "number"},
+        {"key": "ofis_rashody",         "label": "Офисные расходы",            "type": "number"},
+        {"key": "ostatok_nalichnykh",   "label": "Остаток наличных",           "type": "number"},
     ],
-    "aliases": {},          # слово_нижн_регистр → целевая метка
-    "triggers": ["отчет", "отчёт"],   # слова-триггеры в тексте
-    "routes": {},           # ключевое_слово → название листа
+    "aliases": {},
+    # Триггеры — обычный и с хэштегом
+    "triggers": ["отчет", "отчёт", "#отчет", "#отчёт"],
+    "routes": {},
 }
 
 # Поля, которые нельзя удалить
@@ -49,7 +65,7 @@ class ConfigManager:
         self._spreadsheet_id = spreadsheet_id
         self._gs = gs_client
         self._cfg: dict[str, Any] = {}
-        # FIX #16: кэш скомпилированного паттерна триггеров
+        # Кэш скомпилированного паттерна триггеров
         self._trigger_pattern_cache: str | None = None
         self.load()
 
@@ -63,20 +79,25 @@ class ConfigManager:
                 raw = ws.acell("A1").value
                 if raw:
                     self._cfg = json.loads(raw)
-                    self._trigger_pattern_cache = None  # инвалидируем кэш
+                    self._trigger_pattern_cache = None
                     log.info("Конфиг загружен из Google Sheets")
                     return
             except gspread.WorksheetNotFound:
                 pass
         except Exception as e:
             log.warning("Не удалось загрузить конфиг: %s", e)
+
         # Первый запуск — используем дефолт
         self._cfg = json.loads(json.dumps(DEFAULT_CONFIG))
-        self.save()
+        # Сохраняем best-effort: если не получится — работаем с дефолтом в памяти
+        try:
+            self.save()
+        except Exception as e:
+            log.warning("Не удалось сохранить дефолтный конфиг: %s — работаю в памяти", e)
 
     def save(self) -> None:
-        """FIX #2: raise при ошибке сохранения — вызывающий код узнает о проблеме."""
-        self._trigger_pattern_cache = None  # инвалидируем кэш при каждом сохранении
+        """Сохраняет конфиг в Google Sheets. Кидает исключение при ошибке."""
+        self._trigger_pattern_cache = None  # инвалидируем кэш
         try:
             sh = self._gs.open_by_key(self._spreadsheet_id)
             try:
@@ -87,7 +108,13 @@ class ConfigManager:
             log.info("Конфиг сохранён")
         except Exception as e:
             log.error("Не удалось сохранить конфиг: %s", e)
-            raise  # FIX #2: пробрасываем дальше — молча не теряем данные
+            raise  # пробрасываем — вызывающий код покажет ошибку пользователю
+
+    def reset_to_defaults(self) -> None:
+        """Сбрасывает конфиг к заводским настройкам и сохраняет."""
+        self._cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+        self._trigger_pattern_cache = None
+        self.save()
 
     # ── Свойства ───────────────────────────────────────────────────────────
 
@@ -112,7 +139,7 @@ class ConfigManager:
         return self._cfg.get("routes", {})
 
     def trigger_pattern(self) -> str:
-        # FIX #16: кэшируем паттерн — не пересобираем на каждое сообщение
+        # Кэшируем паттерн — не пересобираем на каждое сообщение
         if self._trigger_pattern_cache is None:
             self._trigger_pattern_cache = "|".join(re.escape(t) for t in self.triggers)
         return self._trigger_pattern_cache

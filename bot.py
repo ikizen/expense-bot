@@ -200,7 +200,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>Конфиг</b>\n"
         "/config — текущие настройки\n"
         "/setsheet ID — подключить Google Таблицу по ID\n"
-        "/sheet — ссылка на текущую таблицу"
+        "/sheet — ссылка на текущую таблицу\n"
+        "/resetconfig — сбросить поля к заводским (осторожно!)"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -218,6 +219,26 @@ async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         lines.append("\n<b>Маршруты:</b>")
         for k, s in cfg.routes.items():
             lines.append(f"  • «{k}» → лист «{s}»")
+    lines.append(f"\n<b>Триггеры:</b> {', '.join(cfg.triggers)}")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_resetconfig(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Сбрасывает конфиг к заводским настройкам (поля из отчёта по умолчанию)."""
+    if not _is_allowed(update, context.bot_data["allowed_users"]):
+        return
+    cfg: ConfigManager = context.bot_data["config"]
+    try:
+        await asyncio.to_thread(cfg.reset_to_defaults)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Не удалось сбросить конфиг: {html.escape(str(e))}")
+        return
+    lines = [
+        "✅ <b>Конфиг сброшен к заводским настройкам!</b>\n",
+        "<b>Поля теперь:</b>",
+    ]
+    for f in cfg.fields:
+        lines.append(f"  • {f['label']} ({f['type']})")
     lines.append(f"\n<b>Триггеры:</b> {', '.join(cfg.triggers)}")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
@@ -1257,6 +1278,7 @@ def build_app() -> Application:
     # FIX #4: очищаем протухшие сессии каждые 30 минут
     app.job_queue.run_repeating(cleanup_stale_sessions, interval=1800, first=1800)
 
+    app.add_handler(CommandHandler("resetconfig",  cmd_resetconfig))
     app.add_handler(CommandHandler("menu",        cmd_menu))
     app.add_handler(CommandHandler("sheet",       cmd_sheet))
     app.add_handler(CommandHandler("setsheet",    cmd_setsheet))
