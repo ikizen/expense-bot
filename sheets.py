@@ -109,55 +109,50 @@ class SheetsClient:
             self._ws_cache[sheet_name] = ws
         return self._ws_cache[sheet_name]
 
-    def _fresh_ws(self, sheet_name: str) -> gspread.Worksheet:
-        """Всегда возвращает свежий объект (без кэша). Обновляет кэш."""
-        self._ws_cache.pop(sheet_name, None)
-        return self._get_ws(sheet_name)
-
-    def _ensure_enough_cols(self, ws: gspread.Worksheet, needed: int) -> None:
-        """Расширяет лист если нужных колонок не хватает."""
-        if ws.col_count < needed:
-            new_cols = needed + 10  # +10 запас
-            ws.resize(rows=ws.row_count, cols=new_cols)
-            log.info("Лист '%s' расширен до %d колонок", ws.title, new_cols)
-            # После resize сбрасываем кэш — gspread обновляет grid ID
-            self._ws_cache.pop(ws.title, None)
-
-    def _bold_headers(self, ws: gspread.Worksheet, n_cols: int) -> None:
-        """Форматирует первые n_cols ячеек строки 1 жирным. Не-фатально."""
-        try:
-            end = gspread.utils.rowcol_to_a1(1, n_cols)
-            ws.format(f"A1:{end}", {"textFormat": {"bold": True}})
-        except Exception as e:
-            log.warning("Не удалось отформатировать заголовки (не критично): %s", e)
+    def _resize_if_needed(self, sheet_name: str, needed_cols: int) -> None:
+        """Расширяет лист и сбрасывает кэш если колонок не хватает."""
+        ws = self._get_ws(sheet_name)
+        if ws.col_count < needed_cols:
+            ws.resize(rows=ws.row_count, cols=needed_cols + 10)
+            log.info("Лист '%s' расширен до %d колонок", sheet_name, needed_cols + 10)
+            # После resize всегда берём свежий объект — grid ID может смениться
+            self._ws_cache.pop(sheet_name, None)
 
     # ── Заголовки ─────────────────────────────────────────────────────────
 
     def ensure_headers(self, sheet_name: str | None = None) -> None:
+        """Дозаписывает в строку 1 заголовки которых ещё нет. Не-фатально."""
         name = sheet_name or self.sheet_name
-        ws = self._get_ws(name)
-        existing = ws.row_values(1)
-        headers = self.config.headers
+        try:
+            ws = self._get_ws(name)
+            existing = ws.row_values(1)
+            want = self.config.headers
 
-        if not existing:
-            self._ensure_enough_cols(ws, len(headers))
-            ws = self._fresh_ws(name)   # свежий после возможного resize
-            ws.update("A1", [headers])
-            self._bold_headers(ws, len(headers))
-            log.info("Заголовки записаны на листе '%s'.", name)
-        else:
-            existing_set = set(existing)
-            missing = [h for h in headers if h not in existing_set]
-            if missing:
-                start_col = len(existing) + 1
-                self._ensure_enough_cols(ws, start_col + len(missing) - 1)
-                ws = self._fresh_ws(name)   # свежий после возможного resize
-                for i, h in enumerate(missing):
-                    col = start_col + i
-                    ws.update_cell(1, col, h)
-                    self._bold_headers(ws, col)
-                log.info("Добавлены заголовки на лист '%s': %s", name, missing)
+            if not existing:
+                # Пустой лист — пишем все заголовки одним запросом
+                self._resize_if_needed(name, len(want))
+                ws = self._get_ws(name)
+                ws.update("A1", [want], value_input_option="RAW")
+                log.info("Заголовки записаны на листе '%s'.", name)
+            else:
+                # Есть заголовки — дополняем только недостающие
+                existing_set = set(h for h in existing if h)
+                missing = [h for h in want if h not in existing_set]
+                if not missing:
+                    return
+                # Собираем полный новый ряд: старые + пропуски до нужной длины + новые
+                full = list(existing)
+                start = len(full)
+                self._resize_if_needed(name, start + len(missing))
+                ws = self._get_ws(name)
+                # Один batch-запрос вместо N вызовов update_cell
+                new_vals = full + missing
+                ws.update("A1", [new_vals], value_input_option="RAW")
+                log.info("Добавлены заголовки '%s': %s", name, missing)
                 self._ws_cache.pop(name, None)
+        except Exception as e:
+            log.error("ensure_headers '%s' failed: %s", sheet_name, e)
+            # Не прерываем запись — данные важнее заголовков
 
     def sync_headers(self, sheet_name: str | None = None) -> dict:
         """Перезаписывает строку 1 ровно под текущий конфиг.
@@ -169,18 +164,17 @@ class SheetsClient:
 
         want_set = set(want)
         have_set = set(h for h in have if h)
-
         kept    = [h for h in have if h in want_set]
         cleared = [h for h in have if h and h not in want_set]
         added   = [h for h in want if h not in have_set]
 
-        self._ensure_enough_cols(ws, len(want))
-        ws = self._fresh_ws(name)   # свежий после возможного resize
+        self._resize_if_needed(name, len(want))
+        ws = self._get_ws(name)
 
+        # Один запрос: нужные заголовки + пустые ячейки вместо старых
         n = max(len(have), len(want))
         new_row = (want + [""] * n)[:n]
-        ws.update("A1", [new_row])
-        self._bold_headers(ws, len(want))
+        ws.update("A1", [new_row], value_input_option="RAW")
 
         self._ws_cache.pop(name, None)
         log.info("sync_headers '%s': kept=%d cleared=%d added=%d",
@@ -195,11 +189,9 @@ class SheetsClient:
             sh.worksheet(sheet_name)
             return False
         except gspread.WorksheetNotFound:
-            needed = len(headers or self.config.headers)
-            ws = sh.add_worksheet(title=sheet_name, rows=1000, cols=max(needed + 10, 30))
             hdrs = headers if headers is not None else self.config.headers
-            ws.update("A1", [hdrs])
-            self._bold_headers(ws, len(hdrs))
+            ws = sh.add_worksheet(title=sheet_name, rows=1000, cols=len(hdrs) + 10)
+            ws.update("A1", [hdrs], value_input_option="RAW")
             self._ws_cache[sheet_name] = ws
             return True
 
@@ -208,19 +200,6 @@ class SheetsClient:
             self._ws_cache.pop(sheet_name, None)
         else:
             self._ws_cache.clear()
-
-    # ── Запись строки ─────────────────────────────────────────────────────
-
-    def _get_or_create_col(self, ws: gspread.Worksheet,
-                           headers: list[str], name: str) -> int:
-        if name in headers:
-            return headers.index(name) + 1
-        new_col = len(headers) + 1
-        self._ensure_enough_cols(ws, new_col)
-        ws.update_cell(1, new_col, name)
-        self._bold_headers(ws, new_col)
-        headers.append(name)
-        return new_col
 
     def append_row(self, row: list[Any],
                    sheet_name: str | None = None) -> int:
