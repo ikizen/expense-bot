@@ -163,6 +163,40 @@ class SheetsClient:
             self._ws_cache[sheet_name] = ws
             return True
 
+    def sync_headers(self, sheet_name: str | None = None) -> dict:
+        """Перезаписывает строку 1 листа ровно под текущий конфиг.
+        Лишние старые колонки очищаются, недостающие добавляются.
+        Данные в строках 2+ не трогаются (но могут сместиться — только для чистых листов!).
+        Возвращает {"kept": [...], "cleared": [...], "added": [...]}."""
+        name = sheet_name or self.sheet_name
+        ws = self._get_ws(name)
+        want = self.config.headers          # что должно быть
+        have = ws.row_values(1)             # что есть сейчас
+
+        want_set = set(want)
+        have_set = set(h for h in have if h)
+
+        kept    = [h for h in have if h in want_set]
+        cleared = [h for h in have if h and h not in want_set]
+        added   = [h for h in want if h not in have_set]
+
+        # Расширяем если надо
+        self._ensure_enough_cols(ws, len(want))
+
+        # Пишем нужные заголовки в нужные позиции
+        new_row = want + [""] * (max(len(have), len(want)) - len(want))
+        ws.update("A1", [new_row[:max(len(have), len(want))]])
+
+        # Форматируем жирным только занятые ячейки
+        end_col = gspread.utils.rowcol_to_a1(1, len(want))
+        ws.format(f"A1:{end_col}", {"textFormat": {"bold": True}})
+
+        # Сбрасываем кэш
+        self._ws_cache.pop(name, None)
+        log.info("sync_headers '%s': kept=%d cleared=%d added=%d",
+                 name, len(kept), len(cleared), len(added))
+        return {"kept": kept, "cleared": cleared, "added": added}
+
     def invalidate_cache(self, sheet_name: str | None = None) -> None:
         """Сбрасывает кэш воркшита. Без аргументов — весь кэш."""
         if sheet_name:

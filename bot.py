@@ -201,7 +201,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/config — текущие настройки\n"
         "/setsheet ID — подключить Google Таблицу по ID\n"
         "/sheet — ссылка на текущую таблицу\n"
-        "/resetconfig — сбросить поля к заводским (осторожно!)"
+        "/resetconfig — сбросить поля к заводским (осторожно!)\n"
+        "/syncheaders [лист] — синхронизировать заголовки таблицы с конфигом"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -221,6 +222,36 @@ async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             lines.append(f"  • «{k}» → лист «{s}»")
     lines.append(f"\n<b>Триггеры:</b> {', '.join(cfg.triggers)}")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_syncheaders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Синхронизирует строку заголовков листа с текущим конфигом.
+    Использование: /syncheaders [НазваниеЛиста]"""
+    if not _is_allowed(update, context.bot_data["allowed_users"]):
+        return
+    args = context.args or []
+    sheets: SheetsClient = context.bot_data["sheets"]
+    sheet_name = " ".join(args) if args else sheets.sheet_name
+
+    status = await update.message.reply_text(f"Синхронизирую заголовки листа «{sheet_name}»…")
+    try:
+        result = await asyncio.to_thread(sheets.sync_headers, sheet_name)
+    except Exception as e:
+        await status.edit_text(f"❌ Ошибка: {html.escape(str(e))}")
+        return
+
+    lines = [f"✅ <b>Заголовки листа «{html.escape(sheet_name)}» обновлены!</b>\n"]
+    if result["added"]:
+        lines.append("➕ <b>Добавлены:</b> " + ", ".join(
+            f"<b>{html.escape(h)}</b>" for h in result["added"]))
+    if result["cleared"]:
+        lines.append("🗑 <b>Очищены (старые):</b> " + ", ".join(
+            f"<code>{html.escape(h)}</code>" for h in result["cleared"]))
+    if result["kept"]:
+        lines.append(f"✔️ Без изменений: {len(result['kept'])} колонок")
+    lines.append("\n⚠️ Если в таблице были старые данные — проверь их вручную, "
+                 "строки данных не перемещались.")
+    await status.edit_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def cmd_resetconfig(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1289,6 +1320,7 @@ def build_app() -> Application:
 
     app.post_init = _post_init
 
+    app.add_handler(CommandHandler("syncheaders",  cmd_syncheaders))
     app.add_handler(CommandHandler("resetconfig",  cmd_resetconfig))
     app.add_handler(CommandHandler("menu",        cmd_menu))
     app.add_handler(CommandHandler("sheet",       cmd_sheet))
