@@ -163,7 +163,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Кассир Айгуль\n"
         "Лиды: инст 12, вц 7\n"
         "Расходы: курьеры 8000, закуп гортензии 60к</i>"
-        f"{sheet_line}",
+        f"{sheet_line}\n\n"
+        "<code>v2.0 — меню, кнопки, мультилист</code>",
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
         reply_markup=MAIN_KB,
@@ -761,6 +762,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
     data = query.data or ""
     cfg: ConfigManager = context.bot_data["config"]
+    try:
+        await _handle_callback_inner(query, data, cfg, context)
+    except Exception as e:
+        log.exception("Callback error: %s", data)
+        try:
+            await query.edit_message_text(f"⚠️ Ошибка: {html.escape(str(e))}")
+        except Exception:
+            pass
+
+
+async def _handle_callback_inner(query, data: str, cfg: "ConfigManager",
+                                  context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # ── Мастер создания нового листа ──────────────────────────────────────
     if data.startswith("nst:"):        # toggle столбца
