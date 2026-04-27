@@ -406,13 +406,22 @@ async def _handle_settings_input(
     text = text.strip()
 
     if action in ("col_num", "col_txt"):
+        # Каждая строка = отдельная колонка
+        labels = [l.strip() for l in text.splitlines() if l.strip()]
         ftype = "number" if action == "col_num" else "text"
-        if cfg.add_field(text, ftype):
-            t, kb = _cols_text_and_kb(cfg)
-            await _back_to(t + f"\n\n✅ Добавлена: <b>{html.escape(text)}</b>", kb)
-        else:
-            t, kb = _cols_text_and_kb(cfg)
-            await _back_to(t + f"\n\n⚠️ Уже существует: <b>{html.escape(text)}</b>", kb)
+        added, skipped = [], []
+        for label in labels:
+            if cfg.add_field(label, ftype):
+                added.append(label)
+            else:
+                skipped.append(label)
+        t, kb = _cols_text_and_kb(cfg)
+        note = ""
+        if added:
+            note += "\n\n✅ Добавлены: " + ", ".join(f"<b>{html.escape(l)}</b>" for l in added)
+        if skipped:
+            note += "\n⚠️ Уже есть: " + ", ".join(f"<b>{html.escape(l)}</b>" for l in skipped)
+        await _back_to(t + note, kb)
 
     elif action == "route":
         parts = text.split(None, 1)
@@ -447,14 +456,15 @@ async def _handle_settings_input(
             )
 
     elif action == "newsheet_col":
-        # Добавить новый столбец в список нового листа (не в глобальный конфиг)
-        label = text.strip()
-        if user_id in NEW_SHEET_PENDING and label:
-            NEW_SHEET_PENDING[user_id].setdefault("new_cols", []).append(label)
+        # Добавить столбцы в список нового листа — каждая строка = отдельный столбец
+        labels = [l.strip() for l in text.splitlines() if l.strip()]
+        if user_id in NEW_SHEET_PENDING and labels:
+            NEW_SHEET_PENDING[user_id].setdefault("new_cols", []).extend(labels)
             state2 = NEW_SHEET_PENDING[user_id]
+            added = ", ".join(f"<b>{html.escape(l)}</b>" for l in labels)
             await _back_to(
                 f"📋 Новый лист: <b>{html.escape(state2['name'])}</b>\n\n"
-                f"Выбери столбцы:\n\n✅ Добавлен столбец: <b>{html.escape(label)}</b>",
+                f"Выбери столбцы:\n\n✅ Добавлено: {added}",
                 _newsheet_keyboard(user_id, cfg),
             )
         else:
