@@ -109,14 +109,10 @@ class SheetsClient:
             self._ws_cache[sheet_name] = ws
         return self._ws_cache[sheet_name]
 
-    def _resize_if_needed(self, sheet_name: str, needed_cols: int) -> None:
-        """Расширяет лист и сбрасывает кэш если колонок не хватает."""
-        ws = self._get_ws(sheet_name)
-        if ws.col_count < needed_cols:
-            ws.resize(rows=ws.row_count, cols=needed_cols + 10)
-            log.info("Лист '%s' расширен до %d колонок", sheet_name, needed_cols + 10)
-            # После resize всегда берём свежий объект — grid ID может смениться
-            self._ws_cache.pop(sheet_name, None)
+    def _fresh_ws(self, sheet_name: str) -> gspread.Worksheet:
+        """Возвращает свежий объект листа (не из кэша). Обновляет кэш."""
+        self._ws_cache.pop(sheet_name, None)
+        return self._get_ws(sheet_name)
 
     # ── Заголовки ─────────────────────────────────────────────────────────
 
@@ -124,41 +120,37 @@ class SheetsClient:
         """Дозаписывает в строку 1 заголовки которых ещё нет. Не-фатально."""
         name = sheet_name or self.sheet_name
         try:
-            ws = self._get_ws(name)
+            # Всегда берём свежий объект — col_count в кэше может быть устаревшим
+            ws = self._fresh_ws(name)
             existing = ws.row_values(1)
             want = self.config.headers
 
             if not existing:
-                # Пустой лист — пишем все заголовки одним запросом
-                self._resize_if_needed(name, len(want))
-                ws = self._get_ws(name)
-                ws.update("A1", [want], value_input_option="RAW")
-                log.info("Заголовки записаны на листе '%s'.", name)
+                new_vals = want
             else:
-                # Есть заголовки — дополняем только недостающие
                 existing_set = set(h for h in existing if h)
                 missing = [h for h in want if h not in existing_set]
                 if not missing:
                     return
-                # Собираем полный новый ряд: старые + пропуски до нужной длины + новые
-                full = list(existing)
-                start = len(full)
-                self._resize_if_needed(name, start + len(missing))
-                ws = self._get_ws(name)
-                # Один batch-запрос вместо N вызовов update_cell
-                new_vals = full + missing
-                ws.update("A1", [new_vals], value_input_option="RAW")
-                log.info("Добавлены заголовки '%s': %s", name, missing)
-                self._ws_cache.pop(name, None)
+                new_vals = list(existing) + missing
+
+            # Расширяем лист если нужно (снова свежий объект после resize)
+            if ws.col_count < len(new_vals):
+                ws.resize(rows=ws.row_count, cols=len(new_vals) + 10)
+                ws = self._fresh_ws(name)
+
+            ws.update("A1", [new_vals], value_input_option="RAW")
+            self._ws_cache.pop(name, None)
+            log.info("ensure_headers '%s': %d колонок", name, len(new_vals))
         except Exception as e:
-            log.error("ensure_headers '%s' failed: %s", sheet_name, e)
+            log.error("ensure_headers '%s' failed: %s", name, e)
             # Не прерываем запись — данные важнее заголовков
 
     def sync_headers(self, sheet_name: str | None = None) -> dict:
         """Перезаписывает строку 1 ровно под текущий конфиг.
         Возвращает {"kept": [...], "cleared": [...], "added": [...]}."""
         name = sheet_name or self.sheet_name
-        ws = self._get_ws(name)
+        ws = self._fresh_ws(name)
         want = self.config.headers
         have = ws.row_values(1)
 
@@ -168,14 +160,14 @@ class SheetsClient:
         cleared = [h for h in have if h and h not in want_set]
         added   = [h for h in want if h not in have_set]
 
-        self._resize_if_needed(name, len(want))
-        ws = self._get_ws(name)
-
-        # Один запрос: нужные заголовки + пустые ячейки вместо старых
         n = max(len(have), len(want))
         new_row = (want + [""] * n)[:n]
-        ws.update("A1", [new_row], value_input_option="RAW")
 
+        if ws.col_count < len(new_row):
+            ws.resize(rows=ws.row_count, cols=len(new_row) + 10)
+            ws = self._fresh_ws(name)
+
+        ws.update("A1", [new_row], value_input_option="RAW")
         self._ws_cache.pop(name, None)
         log.info("sync_headers '%s': kept=%d cleared=%d added=%d",
                  name, len(kept), len(cleared), len(added))
