@@ -117,8 +117,6 @@ def _normalize(raw: dict[str, Any], fields: list[dict]) -> dict[str, Any]:
             seen[name] = dict(item)
     out["extra_expenses"] = list(seen.values())
 
-    # Текстовое поле для таблицы — "Сирень: 28 000; Алиса: 18 000"
-    out["extras_text"] = _extras_to_text(out["extra_expenses"])
     return out
 
 
@@ -218,8 +216,6 @@ class ExpenseParser:
                 existing[item["name"]] = item
             merged["extra_expenses"] = list(existing.values())
 
-        # Обновляем текстовое поле вслед за изменёнными extra_expenses
-        merged["extras_text"] = _extras_to_text(merged.get("extra_expenses", []))
         return merged
 
     def row_for_sheet(self, parsed: dict[str, Any]) -> list[Any]:

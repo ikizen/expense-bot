@@ -188,8 +188,11 @@ class SheetsClient:
     # ── Запись строки ─────────────────────────────────────────────────────
 
     def append_row(self, row: list[Any],
-                   sheet_name: str | None = None) -> int:
-        """Добавляет строку данных. Возвращает номер записанной строки."""
+                   sheet_name: str | None = None,
+                   extra_expenses: list[dict] | None = None) -> int:
+        """Добавляет строку данных.
+        extra_expenses — список {"name": str, "amount": number}: каждый записывается
+        в свою колонку (по имени). Если колонки нет — создаётся автоматически."""
         target = sheet_name or self.sheet_name
         ws = self._ws(target)
 
@@ -199,9 +202,32 @@ class SheetsClient:
             ws = self._ws(target)
             sheet_headers = ws.row_values(1)
 
-        config_headers = self.config.headers
-        value_map = dict(zip(config_headers, row))
-        row_values = [value_map.get(hdr, "") for hdr in sheet_headers]
+        # Значения из конфига
+        value_map: dict[str, Any] = dict(zip(self.config.headers, row))
+
+        # Доп. расходы → индивидуальные колонки
+        for item in (extra_expenses or []):
+            name = str(item.get("name", "")).strip()
+            amount = item.get("amount", 0)
+            if not name or not amount:
+                continue
+
+            # Ищем существующую колонку (без учёта регистра)
+            matched = next(
+                (h for h in sheet_headers if h.lower() == name.lower()), None
+            )
+            if matched is None:
+                # Создаём новую колонку прямо сейчас
+                sheet_headers.append(name)
+                ws = self._ensure_cols(ws, len(sheet_headers))
+                col_a1 = gspread.utils.rowcol_to_a1(1, len(sheet_headers))
+                ws.update(col_a1, [[name]], value_input_option="RAW")
+                log.info("Создана колонка '%s' на листе '%s'", name, target)
+                matched = name
+
+            value_map[matched] = amount
+
+        row_values = [value_map.get(h, "") for h in sheet_headers]
 
         # get_all_values даёт точный счётчик строк (включая заголовок)
         all_data = ws.get_all_values()

@@ -1145,9 +1145,12 @@ async def _handle_callback_inner(query, data: str, cfg: "ConfigManager",
     sheets: SheetsClient = context.bot_data["sheets"]
     parser: ExpenseParser = context.bot_data["parser"]
     row = parser.row_for_sheet(parsed)
+    extra_expenses = parsed.get("extra_expenses", [])
 
     try:
-        row_num = await asyncio.to_thread(sheets.append_row, row, sheet_name)
+        row_num = await asyncio.to_thread(
+            sheets.append_row, row, sheet_name, extra_expenses
+        )
     except Exception as e:
         log.exception("sheets append failed")
         await query.edit_message_text(f"Ошибка записи: {html.escape(str(e))}")

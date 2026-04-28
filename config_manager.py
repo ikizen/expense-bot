@@ -49,8 +49,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         {"key": "zarplata",             "label": "Заработная плата",           "type": "number"},
         {"key": "ofis_rashody",         "label": "Офисные расходы",            "type": "number"},
         {"key": "ostatok_nalichnykh",   "label": "Остаток наличных",           "type": "number"},
-        # Доп. расходы — текстом в одну ячейку ("Сирень: 28 000; Алиса: 18 000")
-        {"key": "extras_text",          "label": "Доп. расходы",               "type": "text"},
     ],
     "aliases": {},
     # Триггеры — обычный и с хэштегом
@@ -59,7 +57,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 # Поля, которые нельзя удалить
-PROTECTED_KEYS = {"date", "kassir", "extras_text"}
+PROTECTED_KEYS = {"date", "kassir"}
 
 
 class ConfigManager:
