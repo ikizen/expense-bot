@@ -117,6 +117,8 @@ def _normalize(raw: dict[str, Any], fields: list[dict]) -> dict[str, Any]:
             seen[name] = dict(item)
     out["extra_expenses"] = list(seen.values())
 
+    # Текстовая копия — "Сирень: 28 000; Таргет: 50 000"
+    out["extras_text"] = _extras_to_text(out["extra_expenses"])
     return out
 
 
@@ -215,7 +217,7 @@ class ExpenseParser:
             for item in correction_extra:
                 existing[item["name"]] = item
             merged["extra_expenses"] = list(existing.values())
-
+        merged["extras_text"] = _extras_to_text(merged.get("extra_expenses", []))
         return merged
 
     def row_for_sheet(self, parsed: dict[str, Any]) -> list[Any]:
