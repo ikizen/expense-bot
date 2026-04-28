@@ -42,8 +42,10 @@ def _coerce_number(v: Any) -> float | int:
 
 
 def _build_system_prompt(fields: list[dict]) -> str:
+    today = date.today().isoformat()
+    current_year = date.today().year
     lines = [
-        "Ты извлекаешь данные из отчёта в строгий JSON.\n",
+        f"Сегодня: {today}. Ты извлекаешь данные из отчёта в строгий JSON.\n",
         "Поля (все обязательны; если нет значения — 0 для чисел, пустая строка для текста):",
     ]
     for f in fields:
@@ -51,7 +53,11 @@ def _build_system_prompt(fields: list[dict]) -> str:
         key = f["key"]
         label = f["label"]
         if t == "date":
-            lines.append(f'- {key}: дата в формате YYYY-MM-DD (если не указана — сегодня)')
+            lines.append(
+                f'- {key}: дата в формате YYYY-MM-DD. '
+                f'Если год не указан — используй {current_year}. '
+                f'Если дата не указана вообще — используй {today}.'
+            )
         elif t == "text":
             lines.append(f'- {key}: {label} (строка)')
         else:
@@ -136,14 +142,11 @@ def _extras_to_text(extras: list[dict]) -> str:
 def format_preview(parsed: dict[str, Any], fields: list[dict],
                    sheet_headers: list[str] | None = None) -> str:
     """Формирует текст предпросмотра.
-    sheet_headers — если передан, показываем только поля из этого листа.
-    Дата показывается всегда; числа и текст — только если не пустые/не ноль."""
+    Дата показывается всегда; числа и текст — только если не пустые/не ноль.
+    sheet_headers игнорируется — показываем всё ненулевое (оно будет записано)."""
     lines = []
     for f in fields:
         if f["key"] == "extras_text":
-            continue
-        # Для кастомного листа — пропускаем поля не из его заголовков
-        if sheet_headers is not None and f["label"] not in sheet_headers:
             continue
         val = parsed.get(f["key"], "")
         # Дата — всегда, остальное — только если есть значение

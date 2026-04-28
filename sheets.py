@@ -210,6 +210,18 @@ class SheetsClient:
         # Значения из конфига
         value_map: dict[str, Any] = dict(zip(self.config.headers, row))
 
+        # Ненулевые поля конфига, которых нет в листе → создаём колонку автоматически
+        for label, val in value_map.items():
+            if not val or val in (0, "0", ""):
+                continue
+            if any(h.lower() == label.lower() for h in sheet_headers):
+                continue
+            sheet_headers.append(label)
+            ws = self._ensure_cols(ws, len(sheet_headers))
+            col_a1 = gspread.utils.rowcol_to_a1(1, len(sheet_headers))
+            ws.update(col_a1, [[label]], value_input_option="RAW")
+            log.info("Создана колонка '%s' на листе '%s'", label, target)
+
         # Доп. расходы → индивидуальные колонки
         for item in (extra_expenses or []):
             name = str(item.get("name", "")).strip()
