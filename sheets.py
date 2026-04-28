@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from datetime import date, timedelta, datetime
 from typing import Any, TYPE_CHECKING
 
@@ -24,8 +25,8 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-# Минимальный запас колонок сверх нужных — чтобы лист не кончался
 _COL_BUFFER = 20
+_SESSIONS_SHEET = "_sessions"
 
 
 def create_new_spreadsheet(
@@ -93,122 +94,85 @@ class SheetsClient:
         self.spreadsheet_id = spreadsheet_id
         self.sheet_name = sheet_name
         self.config = config
-        self._ws_cache: dict[str, gspread.Worksheet] = {}
 
-    # ── Получение листа ───────────────────────────────────────────────────
+    # ── Базовые хелперы ───────────────────────────────────────────────────
 
-    def _get_ws(self, sheet_name: str) -> gspread.Worksheet:
-        """Возвращает объект листа. Кэш используется только для быстрых операций записи."""
-        if sheet_name not in self._ws_cache:
-            sh = self.client.open_by_key(self.spreadsheet_id)
-            try:
-                ws = sh.worksheet(sheet_name)
-            except gspread.WorksheetNotFound:
-                log.info("Лист '%s' не найден — создаю.", sheet_name)
-                # Создаём сразу с запасом колонок
-                ws = sh.add_worksheet(
-                    title=sheet_name, rows=1000,
-                    cols=len(self.config.headers) + _COL_BUFFER,
-                )
-            self._ws_cache[sheet_name] = ws
-        return self._ws_cache[sheet_name]
+    def _sh(self) -> gspread.Spreadsheet:
+        return self.client.open_by_key(self.spreadsheet_id)
 
-    def _api_ws(self, sheet_name: str) -> tuple[gspread.Spreadsheet, gspread.Worksheet]:
-        """Всегда делает свежий запрос к API. Возвращает (spreadsheet, worksheet).
-        Создаёт лист если не существует. Использовать перед resize/write заголовков."""
-        sh = self.client.open_by_key(self.spreadsheet_id)
+    def _ws(self, sheet_name: str) -> gspread.Worksheet:
+        """Возвращает лист. Создаёт если не существует. Всегда свежий запрос."""
+        sh = self._sh()
         try:
-            ws = sh.worksheet(sheet_name)
+            return sh.worksheet(sheet_name)
         except gspread.WorksheetNotFound:
             log.info("Лист '%s' не найден — создаю.", sheet_name)
-            ws = sh.add_worksheet(
+            return sh.add_worksheet(
                 title=sheet_name, rows=1000,
                 cols=len(self.config.headers) + _COL_BUFFER,
             )
-        return sh, ws
 
-    def _expand_cols(self, sh: gspread.Spreadsheet,
-                     ws: gspread.Worksheet, needed: int) -> gspread.Worksheet:
-        """Расширяет лист до needed+_COL_BUFFER колонок если нужно.
-        Никогда не уменьшает. Возвращает свежий ws после resize."""
+    def _ensure_cols(self, ws: gspread.Worksheet, needed: int) -> gspread.Worksheet:
+        """Расширяет лист до needed+_COL_BUFFER. Никогда не уменьшает.
+        Возвращает свежий ws после resize (grid ID меняется на сервере)."""
         target = needed + _COL_BUFFER
         if ws.col_count < target:
             ws.resize(rows=ws.row_count, cols=target)
+            ws = self._sh().worksheet(ws.title)
             log.info("Лист '%s' расширен до %d колонок", ws.title, target)
-            # Получаем свежий объект с актуальным col_count после resize
-            ws = sh.worksheet(ws.title)
         return ws
-
-    def invalidate_cache(self, sheet_name: str | None = None) -> None:
-        if sheet_name:
-            self._ws_cache.pop(sheet_name, None)
-        else:
-            self._ws_cache.clear()
 
     # ── Заголовки ─────────────────────────────────────────────────────────
 
     def ensure_headers(self, sheet_name: str | None = None) -> None:
-        """Добавляет недостающие заголовки в строку 1. Расширяет лист если нужно.
-        Не-фатально — ошибка заголовков не прерывает запись данных."""
+        """Добавляет недостающие заголовки. Не-фатально."""
         name = sheet_name or self.sheet_name
         try:
-            # Всегда свежий запрос к API — col_count из кэша ненадёжен
-            sh, ws = self._api_ws(name)
+            ws = self._ws(name)
             existing = ws.row_values(1)
             want = self.config.headers
 
             if not existing:
                 new_vals = want
             else:
-                existing_set = set(h for h in existing if h)
+                existing_set = {h for h in existing if h}
                 missing = [h for h in want if h not in existing_set]
                 if not missing:
-                    # Заголовки уже на месте — обновляем кэш свежим объектом
-                    self._ws_cache[name] = ws
                     return
                 new_vals = list(existing) + missing
 
-            # Расширяем лист (если нужно) и получаем свежий ws
-            ws = self._expand_cols(sh, ws, len(new_vals))
-
+            ws = self._ensure_cols(ws, len(new_vals))
             ws.update("A1", [new_vals], value_input_option="RAW")
-            self._ws_cache[name] = ws
-            log.info("ensure_headers '%s': итого %d колонок", name, len(new_vals))
+            log.info("ensure_headers '%s': %d колонок", name, len(new_vals))
         except Exception as e:
-            log.error("ensure_headers '%s' не удалось: %s", name, e)
-            self._ws_cache.pop(name, None)  # сбрасываем кэш при ошибке
+            log.error("ensure_headers '%s': %s", name, e)
 
     def sync_headers(self, sheet_name: str | None = None) -> dict:
-        """Перезаписывает строку 1 точно под текущий конфиг (убирает старые колонки).
-        Возвращает {"kept", "cleared", "added"}."""
+        """Перезаписывает строку 1 точно под текущий конфиг."""
         name = sheet_name or self.sheet_name
-        sh, ws = self._api_ws(name)
+        ws = self._ws(name)
         want = self.config.headers
         have = ws.row_values(1)
 
         want_set = set(want)
-        have_set = set(h for h in have if h)
+        have_set = {h for h in have if h}
         kept    = [h for h in have if h in want_set]
         cleared = [h for h in have if h and h not in want_set]
         added   = [h for h in want if h not in have_set]
 
-        # Строка 1: нужные заголовки + пустые ячейки поверх старых лишних
         n = max(len(have), len(want))
         new_row = (want + [""] * n)[:n]
 
-        ws = self._expand_cols(sh, ws, n)
+        ws = self._ensure_cols(ws, n)
         ws.update("A1", [new_row], value_input_option="RAW")
-        self._ws_cache.pop(name, None)
-
         log.info("sync_headers '%s': kept=%d cleared=%d added=%d",
                  name, len(kept), len(cleared), len(added))
         return {"kept": kept, "cleared": cleared, "added": added}
 
     def create_sheet(self, sheet_name: str,
                      headers: list[str] | None = None) -> bool:
-        """Создаёт новый лист с заданными заголовками.
-        Возвращает False если лист уже существует."""
-        sh = self.client.open_by_key(self.spreadsheet_id)
+        """Создаёт новый лист. False если уже существует."""
+        sh = self._sh()
         try:
             sh.worksheet(sheet_name)
             return False
@@ -219,38 +183,125 @@ class SheetsClient:
                 cols=len(hdrs) + _COL_BUFFER,
             )
             ws.update("A1", [hdrs], value_input_option="RAW")
-            self._ws_cache[sheet_name] = ws
             return True
 
     # ── Запись строки ─────────────────────────────────────────────────────
 
     def append_row(self, row: list[Any],
                    sheet_name: str | None = None) -> int:
-        """Добавляет строку данных. Перед записью проверяет/дополняет заголовки."""
+        """Добавляет строку данных. Возвращает номер записанной строки."""
         target = sheet_name or self.sheet_name
-        self.ensure_headers(target)
+        ws = self._ws(target)
 
-        ws = self._get_ws(target)
         sheet_headers = ws.row_values(1)
+        if not sheet_headers:
+            self.ensure_headers(target)
+            ws = self._ws(target)
+            sheet_headers = ws.row_values(1)
+
         config_headers = self.config.headers
-        value_map: dict[str, Any] = dict(zip(config_headers, row))
+        value_map = dict(zip(config_headers, row))
+        row_values = [value_map.get(hdr, "") for hdr in sheet_headers]
 
-        next_row = len(ws.col_values(1)) + 1
-
-        cells = [
-            gspread.Cell(next_row, col_idx + 1, value_map[hdr])
-            for col_idx, hdr in enumerate(sheet_headers)
-            if hdr in value_map
-        ]
-
-        ws.update_cells(cells, value_input_option="USER_ENTERED")
+        # get_all_values даёт точный счётчик строк (включая заголовок)
+        all_data = ws.get_all_values()
+        next_row = len(all_data) + 1
+        ws.update(f"A{next_row}", [row_values], value_input_option="USER_ENTERED")
         return next_row
+
+    # ── Сессии (PENDING, пережившие рестарт) ──────────────────────────────
+
+    def _sessions_ws(self) -> gspread.Worksheet:
+        sh = self._sh()
+        try:
+            return sh.worksheet(_SESSIONS_SHEET)
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(_SESSIONS_SHEET, rows=500, cols=5)
+            ws.update("A1", [["token", "sheet", "ts", "data_json"]],
+                      value_input_option="RAW")
+            return ws
+
+    def load_sessions(self) -> dict:
+        """Загружает активные сессии из листа _sessions → {token: entry}."""
+        try:
+            ws = self._sessions_ws()
+            rows = ws.get_all_values()
+            if len(rows) <= 1:
+                return {}
+            cutoff = time.time() - 3600
+            result: dict = {}
+            for row in rows[1:]:
+                if len(row) < 4 or not row[0]:
+                    continue
+                token, sheet, ts_str, data_json = row[0], row[1], row[2], row[3]
+                try:
+                    ts = float(ts_str)
+                    if ts < cutoff:
+                        continue
+                    data = json.loads(data_json)
+                    result[token] = {"data": data, "sheet": sheet, "ts": ts}
+                except Exception:
+                    pass
+            log.info("Загружено %d сессий из Sheets", len(result))
+            return result
+        except Exception as e:
+            log.warning("load_sessions: %s", e)
+            return {}
+
+    def save_session(self, token: str, entry: dict) -> None:
+        """Сохраняет сессию в лист _sessions."""
+        try:
+            ws = self._sessions_ws()
+            ws.append_row([
+                token,
+                entry.get("sheet", ""),
+                str(entry.get("ts", time.time())),
+                json.dumps(entry.get("data", {}), ensure_ascii=False),
+            ], value_input_option="RAW")
+        except Exception as e:
+            log.warning("save_session '%s': %s", token, e)
+
+    def delete_session(self, token: str) -> None:
+        """Удаляет строку сессии из _sessions."""
+        try:
+            ws = self._sessions_ws()
+            cell = ws.find(token, in_column=1)
+            if cell:
+                ws.delete_rows(cell.row)
+        except Exception as e:
+            log.warning("delete_session '%s': %s", token, e)
+
+    def cleanup_sessions(self) -> int:
+        """Удаляет истёкшие строки из _sessions. Возвращает кол-во удалённых."""
+        try:
+            ws = self._sessions_ws()
+            rows = ws.get_all_values()
+            if len(rows) <= 1:
+                return 0
+            cutoff = time.time() - 3600
+            to_delete: list[int] = []
+            for i, row in enumerate(rows[1:], start=2):
+                if not row or not row[0]:
+                    to_delete.append(i)
+                    continue
+                try:
+                    ts = float(row[2]) if len(row) > 2 else 0
+                    if ts < cutoff:
+                        to_delete.append(i)
+                except (ValueError, IndexError):
+                    to_delete.append(i)
+            for idx in reversed(to_delete):
+                ws.delete_rows(idx)
+            return len(to_delete)
+        except Exception as e:
+            log.warning("cleanup_sessions: %s", e)
+            return 0
 
     # ── Dashboard ─────────────────────────────────────────────────────────
 
     def get_stats(self, sheet_name: str | None = None, days: int = 7) -> dict:
         """Возвращает агрегаты за последние N дней."""
-        ws = self._get_ws(sheet_name or self.sheet_name)
+        ws = self._ws(sheet_name or self.sheet_name)
         rows = ws.get_all_values()
         if not rows:
             return {}

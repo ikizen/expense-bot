@@ -133,7 +133,6 @@ async def cmd_setsheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     sheets: SheetsClient = context.bot_data["sheets"]
     sheets.spreadsheet_id = new_id
-    sheets._ws_cache.clear()
 
     cfg: ConfigManager = context.bot_data["config"]
     cfg._spreadsheet_id = new_id
@@ -682,77 +681,62 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     totals = data["totals"]
-    count = data["count"]
-
-    # Группируем поля по типу
-    money_fields = [f for f in cfg.fields if f["type"] == "number" and
-                    any(k in f["label"].lower() for k in ["каспи","наличка","халык","перевод"])]
-    expense_fields = [f for f in cfg.fields if f["type"] == "number" and
-                      any(k in f["label"].lower() for k in ["расход","курьер","закуп","прочие"])]
-    lead_fields = [f for f in cfg.fields if f["type"] == "number" and
-                   any(k in f["label"].lower() for k in ["инстаграм","ватсап","офлайн","постоянн","лиды"])]
-    sale_fields = [f for f in cfg.fields if f["type"] == "number" and
-                   "продаж" in f["label"].lower()]
-
-    # Остальные числовые (кастомные)
-    known = {f["label"] for f in money_fields + expense_fields + lead_fields + sale_fields}
-    other_fields = [f for f in cfg.fields if f["type"] == "number" and
-                    f["label"] not in known and f["label"] in totals and totals[f["label"]] != 0]
+    count  = data["count"]
 
     def fmt(n: float) -> str:
         return f"{int(n):,}".replace(",", " ") + " ₸" if n >= 100 else str(int(n))
 
-    lines = [f"📊 <b>{sheet_name}</b> — последние {days} дн. ({count} записей)\n"]
+    # Группировка по key-паттернам — не зависит от локали меток
+    _PAYMENT  = {"nalichka", "kaspi", "halyk", "perevod", "inostr_valuta"}
+    _EXPENSES = {"dostavka", "zarplata", "ofis_rashody"}
+    _CASH     = {"nalichka_nachalo", "ostatok_nalichnykh"}
 
-    if money_fields:
-        lines.append("💰 <b>Выручка:</b>")
-        total_income = 0.0
-        for f in money_fields:
-            v = totals.get(f["label"], 0)
-            if v:
-                lines.append(f"  {f['label']}: {fmt(v)}")
-                total_income += v
-        if total_income:
-            lines.append(f"  <b>Итого: {fmt(total_income)}</b>")
+    groups: dict[str, list[tuple[str, float]]] = {
+        "💰 Выручка":  [],
+        "📦 Расходы":  [],
+        "💵 Наличные": [],
+        "🎯 Заявки":   [],
+        "🛒 Продажи":  [],
+        "📌 Прочее":   [],
+    }
 
-    if expense_fields:
-        lines.append("\n📦 <b>Расходы:</b>")
-        total_exp = 0.0
-        for f in expense_fields:
-            v = totals.get(f["label"], 0)
-            if v:
-                lines.append(f"  {f['label']}: {fmt(v)}")
-                total_exp += v
-        # Кастомные расходы из extra
-        for col, v in totals.items():
-            if col not in {f["label"] for f in cfg.fields} and v:
-                lines.append(f"  {col}: {fmt(v)}")
-                total_exp += v
-        if total_exp:
-            lines.append(f"  <b>Итого: {fmt(total_exp)}</b>")
+    for f in cfg.fields:
+        if f["type"] != "number":
+            continue
+        key, label = f["key"], f["label"]
+        val = totals.get(label, 0)
+        if key in _PAYMENT:
+            groups["💰 Выручка"].append((label, val))
+        elif key in _EXPENSES:
+            groups["📦 Расходы"].append((label, val))
+        elif key in _CASH:
+            groups["💵 Наличные"].append((label, val))
+        elif key.endswith("_zayavki"):
+            groups["🎯 Заявки"].append((label, val))
+        elif key.endswith("_prodazhi"):
+            groups["🛒 Продажи"].append((label, val))
+        else:
+            groups["📌 Прочее"].append((label, val))
 
-        if money_fields and total_income and total_exp:
-            profit = total_income - total_exp
-            lines.append(f"\n🏦 <b>Прибыль: {fmt(profit)}</b>")
+    income_total  = sum(v for _, v in groups["💰 Выручка"])
+    expense_total = sum(v for _, v in groups["📦 Расходы"])
 
-    if lead_fields:
-        parts = [f"{f['label']}: {int(totals.get(f['label'],0))}" for f in lead_fields if totals.get(f['label'],0)]
-        if parts:
-            total_leads = sum(totals.get(f['label'], 0) for f in lead_fields)
-            lines.append(f"\n👥 <b>Лиды:</b> {int(total_leads)}")
-            lines.append("  " + " | ".join(parts))
+    lines = [f"📊 <b>{html.escape(sheet_name)}</b> — {days} дн. ({count} записей)\n"]
 
-    if sale_fields:
-        parts = [f"{f['label']}: {int(totals.get(f['label'],0))}" for f in sale_fields if totals.get(f['label'],0)]
-        if parts:
-            total_sales = sum(totals.get(f['label'], 0) for f in sale_fields)
-            lines.append(f"\n🛒 <b>Продажи:</b> {int(total_sales)}")
-            lines.append("  " + " | ".join(parts))
+    for title, items in groups.items():
+        non_zero = [(l, v) for l, v in items if v]
+        if not non_zero:
+            continue
+        lines.append(f"\n{title}:")
+        for label, val in non_zero:
+            lines.append(f"  {html.escape(label)}: {fmt(val)}")
+        group_sum = sum(v for _, v in non_zero)
+        if len(non_zero) > 1:
+            lines.append(f"  <b>Итого: {fmt(group_sum)}</b>")
 
-    if other_fields:
-        lines.append("\n📌 <b>Прочее:</b>")
-        for f in other_fields:
-            lines.append(f"  {f['label']}: {fmt(totals[f['label']])}")
+    if income_total and expense_total:
+        profit = income_total - expense_total
+        lines.append(f"\n🏦 <b>Прибыль: {fmt(profit)}</b>")
 
     await status.edit_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
@@ -809,8 +793,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     token = uuid.uuid4().hex[:12]
-    # FIX #4: сохраняем время создания для TTL-очистки
     PENDING[token] = {"data": parsed, "sheet": sheet_name, "ts": time.time()}
+    try:
+        await asyncio.to_thread(sheets.save_session, token, PENDING[token])
+    except Exception as e:
+        log.warning("save_session: %s", e)
 
     sheet_label = f" → <b>{sheet_name}</b>" if sheet_name != sheets.sheet_name else ""
     preview = format_preview(parsed, cfg.fields)
@@ -1142,6 +1129,11 @@ async def _handle_callback_inner(query, data: str, cfg: "ConfigManager",
     if entry is None:
         await query.edit_message_text("Сессия истекла. Пришли отчёт заново.")
         return
+    sheets_client: SheetsClient = context.bot_data["sheets"]
+    try:
+        await asyncio.to_thread(sheets_client.delete_session, token)
+    except Exception as e:
+        log.warning("delete_session: %s", e)
     if action == "no":
         await query.edit_message_text("Отменено.")
         return
@@ -1191,11 +1183,17 @@ def _do_cleanup() -> None:
                  len(expired_tokens), len(stale_users), len(stale_ns))
 
 
-async def _cleanup_loop() -> None:
-    """Фоновая задача: чистим каждые 30 минут."""
+async def _cleanup_loop(sheets: "SheetsClient") -> None:
+    """Фоновая задача: чистим память и лист _sessions каждые 30 минут."""
     while True:
         await asyncio.sleep(1800)
         _do_cleanup()
+        try:
+            removed = await asyncio.to_thread(sheets.cleanup_sessions)
+            if removed:
+                log.info("Удалено %d истёкших сессий из Sheets", removed)
+        except Exception as e:
+            log.warning("cleanup_sessions: %s", e)
 
 
 # ── Bootstrap ──────────────────────────────────────────────────────────────
@@ -1289,6 +1287,11 @@ def build_app() -> Application:
 
     if spreadsheet_id:
         sheets.ensure_headers()
+        try:
+            existing_sessions = sheets.load_sessions()
+            PENDING.update(existing_sessions)
+        except Exception as e:
+            log.warning("Не удалось загрузить сессии: %s", e)
     parser = ExpenseParser(api_key=groq_key, config=config)
 
     # Извлекаем email сервисного аккаунта для инструкций
@@ -1313,9 +1316,8 @@ def build_app() -> Application:
         "service_account_email": sa_email,
     })
 
-    # FIX #4: фоновая очистка через asyncio (без job-queue зависимости)
     async def _post_init(application: Application) -> None:
-        asyncio.get_event_loop().create_task(_cleanup_loop())
+        asyncio.create_task(_cleanup_loop(application.bot_data["sheets"]))
 
     app.post_init = _post_init
 
