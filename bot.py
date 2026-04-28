@@ -533,104 +533,87 @@ async def _handle_settings_input(
                 parse_mode=ParseMode.HTML,
             )
 
-    elif action == "newsheet_col":
-        # Добавить столбцы в список нового листа — каждая строка = отдельный столбец
-        labels = [l.strip() for l in text.splitlines() if l.strip()]
-        if user_id in NEW_SHEET_PENDING and labels:
-            NEW_SHEET_PENDING[user_id].setdefault("new_cols", []).extend(labels)
-            state2 = NEW_SHEET_PENDING[user_id]
-            added = ", ".join(f"<b>{html.escape(l)}</b>" for l in labels)
-            await _back_to(
-                f"📋 Новый лист: <b>{html.escape(state2['name'])}</b>\n\n"
-                f"Выбери столбцы:\n\n✅ Добавлено: {added}",
-                _newsheet_keyboard(user_id, cfg),
+    elif action == "newsheet_name":
+        name = text.strip().lstrip("#").strip()
+        if not name or len(name) > 100:
+            SETTINGS_WAITING[user_id] = state
+            await update.message.reply_text(
+                "⚠️ Название не может быть пустым или длиннее 100 символов."
             )
-        else:
-            await update.message.reply_text("⚠️ Название не может быть пустым.")
-
-
-# ── Мастер создания нового листа ──────────────────────────────────────────
-
-def _newsheet_keyboard(user_id: int, cfg: ConfigManager) -> InlineKeyboardMarkup:
-    """Клавиатура выбора столбцов для нового листа."""
-    state = NEW_SHEET_PENDING.get(user_id, {})
-    selected: set[str] = state.get("selected", set())
-    new_cols: list[str] = state.get("new_cols", [])
-    fields = cfg.fields
-
-    # Существующие поля — по 2 в ряд
-    rows: list[list[InlineKeyboardButton]] = []
-    pair: list[InlineKeyboardButton] = []
-    for i, f in enumerate(fields):
-        label = f["label"]
-        mark = "✅" if label in selected else "☐"
-        btn = InlineKeyboardButton(
-            f"{mark} {label}",
-            callback_data=f"nst:{user_id}:{i}",  # индекс, не ключ
+            return
+        NEW_SHEET_PENDING[user_id] = {"name": name, "cols": [], "ts": time.time()}
+        SETTINGS_WAITING[user_id] = {
+            "action": "newsheet_cols",
+            "chat_id": state["chat_id"],
+            "msg_id": state["msg_id"],
+        }
+        await _back_to(
+            f"📋 Лист: <b>{html.escape(name)}</b>\n\n"
+            "Напиши столбцы через запятую:\n\n"
+            "<i>Пример: Дата, Флорист, Наличные, Kaspi, Итого</i>",
+            InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Отмена", callback_data=f"nsx:{user_id}"),
+            ]]),
         )
-        pair.append(btn)
-        if len(pair) == 2:
-            rows.append(pair)
-            pair = []
-    if pair:
-        rows.append(pair)
 
-    # Новые пользовательские столбцы — каждый с кнопкой ➖ удалить
-    for idx, col in enumerate(new_cols):
-        rows.append([
-            InlineKeyboardButton(f"✅ {col}", callback_data="noop"),
-            InlineKeyboardButton("➖", callback_data=f"nsdc:{user_id}:{idx}"),
+    elif action in ("newsheet_cols", "newsheet_col"):
+        labels = [l.strip() for l in re.split(r"[,\n]+", text) if l.strip()]
+        if not labels:
+            SETTINGS_WAITING[user_id] = state
+            await update.message.reply_text(
+                "⚠️ Напиши хотя бы один столбец через запятую."
+            )
+            return
+        state2 = NEW_SHEET_PENDING.get(user_id)
+        if not state2:
+            await update.message.reply_text("Сессия истекла. Запусти /newsheet заново.")
+            return
+        state2["cols"] = labels
+        cols_preview = "\n".join(f"  • {html.escape(l)}" for l in labels)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Создать лист",      callback_data=f"nsc:{user_id}")],
+            [InlineKeyboardButton("✏️ Изменить столбцы", callback_data=f"nse:{user_id}")],
+            [InlineKeyboardButton("❌ Отмена",            callback_data=f"nsx:{user_id}")],
         ])
-
-    selected_count = len(selected) + len(new_cols)
-    total_count = len(fields) + len(new_cols)
-    rows.append([
-        InlineKeyboardButton("➕ Добавить столбец", callback_data=f"nsa:{user_id}"),
-    ])
-    rows.append([
-        InlineKeyboardButton(
-            f"✅ Создать лист ({selected_count}/{total_count})",
-            callback_data=f"nsc:{user_id}",
-        ),
-        InlineKeyboardButton("❌ Отмена", callback_data=f"nsx:{user_id}"),
-    ])
-    return InlineKeyboardMarkup(rows)
+        await _back_to(
+            f"📋 Лист: <b>{html.escape(state2['name'])}</b>\n\n"
+            f"Столбцы ({len(labels)}):\n{cols_preview}\n\n"
+            "Создать?",
+            kb,
+        )
 
 
 async def cmd_newsheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(update, context.bot_data["allowed_users"]):
         return
     args = context.args or []
-    if not args:
-        await update.message.reply_text("Использование: /newsheet Название")
-        return
-    name = " ".join(args).strip()
-    # FIX #10: Google Sheets ограничивает имя листа 100 символами
+    name = " ".join(args).strip().lstrip("#").strip()
+    user_id = update.effective_user.id
+
     if not name:
-        await update.message.reply_text("❌ Название не может быть пустым.")
+        await update.message.reply_text("Использование: /newsheet Название")
         return
     if len(name) > 100:
         await update.message.reply_text(
-            f"❌ Название слишком длинное ({len(name)} символов). Максимум — 100."
+            f"❌ Название слишком длинное ({len(name)} симв.). Максимум — 100."
         )
         return
-    cfg: ConfigManager = context.bot_data["config"]
-    user_id = update.effective_user.id
 
-    # Инициализируем состояние — все столбцы выбраны по умолчанию
-    NEW_SHEET_PENDING[user_id] = {
-        "name": name,
-        "selected": {f["label"] for f in cfg.fields},
-        "new_cols": [],   # новые столбцы добавленные прямо здесь
-        "ts": time.time(),  # FIX #4/#21: для TTL-очистки
-    }
-
-    await update.message.reply_text(
+    NEW_SHEET_PENDING[user_id] = {"name": name, "cols": [], "ts": time.time()}
+    msg = await update.message.reply_text(
         f"📋 Новый лист: <b>{html.escape(name)}</b>\n\n"
-        "Выбери столбцы (все выбраны — нажимай чтобы убрать лишние):",
-        reply_markup=_newsheet_keyboard(user_id, cfg),
+        "Напиши столбцы через запятую:\n\n"
+        "<i>Пример: Дата, Флорист, Наличные, Kaspi, Расход, Итого</i>",
         parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Отмена", callback_data=f"nsx:{user_id}"),
+        ]]),
     )
+    SETTINGS_WAITING[user_id] = {
+        "action": "newsheet_cols",
+        "chat_id": update.message.chat_id,
+        "msg_id": msg.message_id,
+    }
 
 
 async def cmd_addroute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -856,55 +839,32 @@ async def _handle_callback_inner(query, data: str, cfg: "ConfigManager",
                                   context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # ── Мастер создания нового листа ──────────────────────────────────────
-    if data.startswith("nst:"):        # toggle столбца
-        _, uid_str, idx_str = data.split(":", 2)
-        uid = int(uid_str)
-        if uid not in NEW_SHEET_PENDING:
-            await query.edit_message_text("Сессия истекла. Запусти /newsheet заново.")
-            return
-        state = NEW_SHEET_PENDING[uid]
-        idx = int(idx_str)
-        label = cfg.fields[idx]["label"] if idx < len(cfg.fields) else None
-        if label:
-            if label in state["selected"]:
-                state["selected"].discard(label)
-            else:
-                state["selected"].add(label)
-        await query.edit_message_reply_markup(
-            reply_markup=_newsheet_keyboard(uid, cfg)
-        )
-        return
-
     if data.startswith("nsc:"):        # создать лист
         uid = int(data.split(":", 1)[1])
         state = NEW_SHEET_PENDING.pop(uid, None)
+        SETTINGS_WAITING.pop(uid, None)
         if not state:
             await query.edit_message_text("Сессия истекла. Запусти /newsheet заново.")
             return
         name = state["name"]
-        selected_labels = state["selected"]
-        new_cols: list[str] = state.get("new_cols", [])
-        if not selected_labels and not new_cols:
-            await query.answer("Выбери хотя бы один столбец!", show_alert=True)
+        cols: list[str] = state.get("cols", [])
+        if not cols:
+            await query.answer("Нет столбцов!", show_alert=True)
             NEW_SHEET_PENDING[uid] = state
             return
-
-        # Сортируем по порядку конфига, затем новые столбцы в конце
-        ordered = [f["label"] for f in cfg.fields if f["label"] in selected_labels]
-        ordered += new_cols   # новые столбцы идут после стандартных
         sheets: SheetsClient = context.bot_data["sheets"]
         try:
-            created = await asyncio.to_thread(sheets.create_sheet, name, ordered)
+            created = await asyncio.to_thread(sheets.create_sheet, name, cols)
         except Exception as e:
-            await query.edit_message_text(f"Ошибка: {html.escape(str(e))}")
+            await query.edit_message_text(f"❌ Ошибка: {html.escape(str(e))}")
             return
         if created:
-            cols_text = " | ".join(ordered)
+            route_hint = name.lower()
             await query.edit_message_text(
                 f"✅ Лист <b>{html.escape(name)}</b> создан!\n\n"
-                f"<b>Столбцы:</b> {html.escape(cols_text)}\n\n"
-                f"Чтобы отправлять отчёты туда:\n"
-                f"/addroute ключевоеслово {html.escape(name)}",
+                f"<b>Столбцы:</b> {html.escape(', '.join(cols))}\n\n"
+                f"Чтобы отчёты с «#{html.escape(route_hint)}» шли туда:\n"
+                f"<code>/addroute {html.escape(route_hint)} {html.escape(name)}</code>",
                 parse_mode=ParseMode.HTML,
             )
         else:
@@ -914,64 +874,32 @@ async def _handle_callback_inner(query, data: str, cfg: "ConfigManager",
             )
         return
 
-    if data.startswith("nsx:"):        # отмена
-        uid = int(data.split(":", 1)[1])
-        NEW_SHEET_PENDING.pop(uid, None)
-        SETTINGS_WAITING.pop(uid, None)
-        await query.edit_message_text("Отменено.")
-        return
-
-    if data.startswith("nsa:"):        # добавить новый столбец
+    if data.startswith("nse:"):        # изменить столбцы (ввести заново)
         uid = int(data.split(":", 1)[1])
         if uid not in NEW_SHEET_PENDING:
             await query.edit_message_text("Сессия истекла. Запусти /newsheet заново.")
             return
         SETTINGS_WAITING[uid] = {
-            "action": "newsheet_col",
+            "action": "newsheet_cols",
             "chat_id": query.message.chat_id,
             "msg_id": query.message.message_id,
         }
         await query.edit_message_text(
             f"📋 Лист: <b>{html.escape(NEW_SHEET_PENDING[uid]['name'])}</b>\n\n"
-            "✏️ Введи название нового столбца:\n"
-            "<i>Просто напиши в чат</i>",
+            "Напиши столбцы заново через запятую:\n\n"
+            "<i>Пример: Дата, Флорист, Наличные, Kaspi</i>",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ Отмена", callback_data=f"nsac:{uid}"),
+                InlineKeyboardButton("❌ Отмена", callback_data=f"nsx:{uid}"),
             ]]),
             parse_mode=ParseMode.HTML,
         )
         return
 
-    if data.startswith("nsac:"):       # отмена ввода столбца
+    if data.startswith("nsx:"):        # отмена
         uid = int(data.split(":", 1)[1])
+        NEW_SHEET_PENDING.pop(uid, None)
         SETTINGS_WAITING.pop(uid, None)
-        if uid in NEW_SHEET_PENDING:
-            cfg2: ConfigManager = context.bot_data["config"]
-            state2 = NEW_SHEET_PENDING[uid]
-            await query.edit_message_text(
-                f"📋 Новый лист: <b>{html.escape(state2['name'])}</b>\n\n"
-                "Выбери столбцы:",
-                reply_markup=_newsheet_keyboard(uid, cfg2),
-                parse_mode=ParseMode.HTML,
-            )
-        return
-
-    if data.startswith("nsdc:"):       # удалить новый столбец из списка
-        _, uid_str, idx_str = data.split(":", 2)
-        uid = int(uid_str)
-        idx = int(idx_str)
-        if uid in NEW_SHEET_PENDING:
-            cols = NEW_SHEET_PENDING[uid].get("new_cols", [])
-            if 0 <= idx < len(cols):
-                cols.pop(idx)
-            cfg3: ConfigManager = context.bot_data["config"]
-            state3 = NEW_SHEET_PENDING[uid]
-            await query.edit_message_reply_markup(
-                reply_markup=_newsheet_keyboard(uid, cfg3)
-            )
-        return
-
-    if data == "noop":
+        await query.edit_message_text("Отменено.")
         return
 
     # ── Меню настроек (m_*) ────────────────────────────────────────────────
@@ -1093,10 +1021,13 @@ async def _handle_callback_inner(query, data: str, cfg: "ConfigManager",
             await query.edit_message_text(t, reply_markup=kb, parse_mode=ParseMode.HTML)
 
         elif data == "m_newsheet_menu":
+            SETTINGS_WAITING[uid] = {
+                "action": "newsheet_name",
+                "chat_id": query.message.chat_id,
+                "msg_id": query.message.message_id,
+            }
             await query.edit_message_text(
-                "Напиши команду:\n<code>/newsheet Название</code>\n\n"
-                "Например: <code>/newsheet Финансы</code>\n\n"
-                "После этого выберешь столбцы кнопками.",
+                "📋 <b>Создание нового листа</b>\n\nНапиши название листа:",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("◀️ Назад", callback_data="m_main")
                 ]]),
