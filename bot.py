@@ -775,15 +775,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await status_msg.edit_text(f"Ошибка разбора: {html.escape(str(e))}")
         return
 
+    # Заголовки целевого листа — для умного предпросмотра
+    sheet_headers: list[str] | None = None
+    if sheet_name != sheets.sheet_name:
+        try:
+            sheet_headers = await asyncio.to_thread(sheets.get_headers, sheet_name)
+        except Exception:
+            pass
+
     token = uuid.uuid4().hex[:12]
-    PENDING[token] = {"data": parsed, "sheet": sheet_name, "ts": time.time()}
+    PENDING[token] = {
+        "data": parsed, "sheet": sheet_name,
+        "sheet_headers": sheet_headers, "ts": time.time(),
+    }
     try:
         await asyncio.to_thread(sheets.save_session, token, PENDING[token])
     except Exception as e:
         log.warning("save_session: %s", e)
 
     sheet_label = f" → <b>{sheet_name}</b>" if sheet_name != sheets.sheet_name else ""
-    preview = format_preview(parsed, cfg.fields)
+    preview = format_preview(parsed, cfg.fields, sheet_headers)
     await status_msg.edit_text(
         f"Проверь данные{sheet_label}:\n\n{preview}",
         reply_markup=_make_keyboard(token),
@@ -812,9 +823,12 @@ async def _handle_edit_correction(
         await status_msg.edit_text(f"Ошибка: {html.escape(str(e))}. Попробуй ещё раз.")
         return
 
-    PENDING[token] = {"data": merged, "sheet": entry["sheet"]}
+    PENDING[token] = {
+        "data": merged, "sheet": entry["sheet"],
+        "sheet_headers": entry.get("sheet_headers"),
+    }
     await status_msg.edit_text(
-        f"Обновлено:\n\n{format_preview(merged, cfg.fields)}",
+        f"Обновлено:\n\n{format_preview(merged, cfg.fields, entry.get('sheet_headers'))}",
         reply_markup=_make_keyboard(token),
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -1087,8 +1101,10 @@ async def _handle_callback_inner(query, data: str, cfg: "ConfigManager",
         await query.edit_message_text(f"Ошибка записи: {html.escape(str(e))}")
         return
 
+    sheet_headers = entry.get("sheet_headers")
     await query.edit_message_text(
-        f"Записал в строку {row_num} → *{sheet_name}*. ✅\n\n{format_preview(parsed, cfg.fields)}",
+        f"Записал в строку {row_num} → *{sheet_name}*. ✅\n\n"
+        f"{format_preview(parsed, cfg.fields, sheet_headers)}",
         parse_mode=ParseMode.MARKDOWN,
     )
 

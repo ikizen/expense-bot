@@ -124,6 +124,11 @@ class SheetsClient:
 
     # ── Заголовки ─────────────────────────────────────────────────────────
 
+    def get_headers(self, sheet_name: str | None = None) -> list[str]:
+        """Возвращает заголовки строки 1 указанного листа."""
+        ws = self._ws(sheet_name or self.sheet_name)
+        return [h for h in ws.row_values(1) if h]
+
     def ensure_headers(self, sheet_name: str | None = None) -> None:
         """Добавляет недостающие заголовки. Не-фатально."""
         name = sheet_name or self.sheet_name

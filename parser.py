@@ -133,20 +133,35 @@ def _extras_to_text(extras: list[dict]) -> str:
     return "; ".join(parts)
 
 
-def format_preview(parsed: dict[str, Any], fields: list[dict]) -> str:
-    # Показываем поля конфига, кроме extras_text (он выводится отдельно)
-    lines = [
-        f"*{f['label']}:* {parsed.get(f['key'], '')}"
-        for f in fields
-        if f["key"] != "extras_text"
-    ]
+def format_preview(parsed: dict[str, Any], fields: list[dict],
+                   sheet_headers: list[str] | None = None) -> str:
+    """Формирует текст предпросмотра.
+    sheet_headers — если передан, показываем только поля из этого листа.
+    Дата показывается всегда; числа и текст — только если не пустые/не ноль."""
+    lines = []
+    for f in fields:
+        if f["key"] == "extras_text":
+            continue
+        # Для кастомного листа — пропускаем поля не из его заголовков
+        if sheet_headers is not None and f["label"] not in sheet_headers:
+            continue
+        val = parsed.get(f["key"], "")
+        # Дата — всегда, остальное — только если есть значение
+        if f["key"] != "date":
+            if f["type"] == "number" and not val:
+                continue
+            if f["type"] == "text" and not str(val).strip():
+                continue
+        lines.append(f"*{f['label']}:* {val}")
+
     extra = parsed.get("extra_expenses", [])
     if extra:
         lines.append("\n*Доп. расходы:*")
         for item in extra:
             amount_str = f"{item['amount']:,}".replace(",", " ")
             lines.append(f"  • {item['name']}: {amount_str}")
-    return "\n".join(lines)
+
+    return "\n".join(lines) or "_(данные не распознаны)_"
 
 
 class ExpenseParser:
