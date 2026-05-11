@@ -192,12 +192,16 @@ class SheetsClient:
 
     # ── Запись строки ─────────────────────────────────────────────────────
 
+    _RAW_TEXT_COL = "Исходный отчёт"
+
     def append_row(self, row: list[Any],
                    sheet_name: str | None = None,
-                   extra_expenses: list[dict] | None = None) -> int:
+                   extra_expenses: list[dict] | None = None,
+                   raw_text: str | None = None) -> int:
         """Добавляет строку данных.
         extra_expenses — список {"name": str, "amount": number}: каждый записывается
-        в свою колонку (по имени). Если колонки нет — создаётся автоматически."""
+        в свою колонку (по имени). Если колонки нет — создаётся автоматически.
+        raw_text — исходный текст отчёта; пишется в колонку 'Исходный отчёт'."""
         target = sheet_name or self.sheet_name
         ws = self._ws(target)
 
@@ -210,17 +214,26 @@ class SheetsClient:
         # Значения из конфига
         value_map: dict[str, Any] = dict(zip(self.config.headers, row))
 
-        # Ненулевые поля конфига, которых нет в листе → создаём колонку автоматически
+        def _find_or_create_col(col_name: str) -> str:
+            """Возвращает точное название колонки (из sheet_headers), создаёт если нет."""
+            matched = next((h for h in sheet_headers if h.lower() == col_name.lower()), None)
+            if matched is None:
+                sheet_headers.append(col_name)
+                ws2 = self._ensure_cols(ws, len(sheet_headers))
+                # После _ensure_cols ws может обновиться — обновляем локальную ссылку
+                nonlocal ws
+                ws = ws2
+                col_a1 = gspread.utils.rowcol_to_a1(1, len(sheet_headers))
+                ws.update(col_a1, [[col_name]], value_input_option="RAW")
+                log.info("Создана колонка '%s' на листе '%s'", col_name, target)
+                matched = col_name
+            return matched
+
+        # Ненулевые поля конфига, которых нет в листе → создаём колонку
         for label, val in value_map.items():
             if not val or val in (0, "0", ""):
                 continue
-            if any(h.lower() == label.lower() for h in sheet_headers):
-                continue
-            sheet_headers.append(label)
-            ws = self._ensure_cols(ws, len(sheet_headers))
-            col_a1 = gspread.utils.rowcol_to_a1(1, len(sheet_headers))
-            ws.update(col_a1, [[label]], value_input_option="RAW")
-            log.info("Создана колонка '%s' на листе '%s'", label, target)
+            _find_or_create_col(label)
 
         # Доп. расходы → индивидуальные колонки
         for item in (extra_expenses or []):
@@ -228,21 +241,13 @@ class SheetsClient:
             amount = item.get("amount", 0)
             if not name or not amount:
                 continue
-
-            # Ищем существующую колонку (без учёта регистра)
-            matched = next(
-                (h for h in sheet_headers if h.lower() == name.lower()), None
-            )
-            if matched is None:
-                # Создаём новую колонку прямо сейчас
-                sheet_headers.append(name)
-                ws = self._ensure_cols(ws, len(sheet_headers))
-                col_a1 = gspread.utils.rowcol_to_a1(1, len(sheet_headers))
-                ws.update(col_a1, [[name]], value_input_option="RAW")
-                log.info("Создана колонка '%s' на листе '%s'", name, target)
-                matched = name
-
+            matched = _find_or_create_col(name)
             value_map[matched] = amount
+
+        # Исходный текст отчёта → последняя колонка
+        if raw_text:
+            matched = _find_or_create_col(self._RAW_TEXT_COL)
+            value_map[matched] = raw_text.strip()
 
         row_values = [value_map.get(h, "") for h in sheet_headers]
 

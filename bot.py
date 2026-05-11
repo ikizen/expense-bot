@@ -786,7 +786,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     token = uuid.uuid4().hex[:12]
     PENDING[token] = {
         "data": parsed, "sheet": sheet_name,
-        "sheet_headers": sheet_headers, "ts": time.time(),
+        "sheet_headers": sheet_headers, "raw_text": text,
+        "ts": time.time(),
     }
     try:
         await asyncio.to_thread(sheets.save_session, token, PENDING[token])
@@ -1091,10 +1092,11 @@ async def _handle_callback_inner(query, data: str, cfg: "ConfigManager",
     parser: ExpenseParser = context.bot_data["parser"]
     row = parser.row_for_sheet(parsed)
     extra_expenses = parsed.get("extra_expenses", [])
+    raw_text = entry.get("raw_text", "")
 
     try:
         row_num = await asyncio.to_thread(
-            sheets.append_row, row, sheet_name, extra_expenses
+            sheets.append_row, row, sheet_name, extra_expenses, raw_text
         )
     except Exception as e:
         log.exception("sheets append failed")
