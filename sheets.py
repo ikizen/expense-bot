@@ -214,26 +214,23 @@ class SheetsClient:
         # Значения из конфига
         value_map: dict[str, Any] = dict(zip(self.config.headers, row))
 
-        def _find_or_create_col(col_name: str) -> str:
-            """Возвращает точное название колонки (из sheet_headers), создаёт если нет."""
+        def _ensure_col(col_name: str) -> tuple[str, gspread.Worksheet]:
+            """Находит или создаёт колонку. Возвращает (matched_name, ws)."""
             matched = next((h for h in sheet_headers if h.lower() == col_name.lower()), None)
             if matched is None:
                 sheet_headers.append(col_name)
-                ws2 = self._ensure_cols(ws, len(sheet_headers))
-                # После _ensure_cols ws может обновиться — обновляем локальную ссылку
-                nonlocal ws
-                ws = ws2
+                fresh = self._ensure_cols(ws, len(sheet_headers))
                 col_a1 = gspread.utils.rowcol_to_a1(1, len(sheet_headers))
-                ws.update(col_a1, [[col_name]], value_input_option="RAW")
+                fresh.update(col_a1, [[col_name]], value_input_option="RAW")
                 log.info("Создана колонка '%s' на листе '%s'", col_name, target)
-                matched = col_name
-            return matched
+                return col_name, fresh
+            return matched, ws
 
         # Ненулевые поля конфига, которых нет в листе → создаём колонку
         for label, val in value_map.items():
             if not val or val in (0, "0", ""):
                 continue
-            _find_or_create_col(label)
+            _, ws = _ensure_col(label)
 
         # Доп. расходы → индивидуальные колонки
         for item in (extra_expenses or []):
@@ -241,12 +238,12 @@ class SheetsClient:
             amount = item.get("amount", 0)
             if not name or not amount:
                 continue
-            matched = _find_or_create_col(name)
+            matched, ws = _ensure_col(name)
             value_map[matched] = amount
 
         # Исходный текст отчёта → последняя колонка
         if raw_text:
-            matched = _find_or_create_col(self._RAW_TEXT_COL)
+            matched, ws = _ensure_col(self._RAW_TEXT_COL)
             value_map[matched] = raw_text.strip()
 
         row_values = [value_map.get(h, "") for h in sheet_headers]
