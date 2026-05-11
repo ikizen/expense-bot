@@ -794,12 +794,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception as e:
         log.warning("save_session: %s", e)
 
-    sheet_label = f" → <b>{sheet_name}</b>" if sheet_name != sheets.sheet_name else ""
+    sheet_label = f" → <b>{html.escape(sheet_name)}</b>" if sheet_name != sheets.sheet_name else ""
     preview = format_preview(parsed, cfg.fields, sheet_headers)
     await status_msg.edit_text(
         f"Проверь данные{sheet_label}:\n\n{preview}",
         reply_markup=_make_keyboard(token),
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -831,7 +831,7 @@ async def _handle_edit_correction(
     await status_msg.edit_text(
         f"Обновлено:\n\n{format_preview(merged, cfg.fields, entry.get('sheet_headers'))}",
         reply_markup=_make_keyboard(token),
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -1063,7 +1063,8 @@ async def _handle_callback_inner(query, data: str, cfg: "ConfigManager",
             await query.edit_message_text("Сессия истекла.")
             return
         EDIT_WAITING[query.from_user.id] = token
-        preview = format_preview(PENDING[token]["data"], cfg.fields)
+        entry_data = PENDING[token]
+        preview = format_preview(entry_data["data"], cfg.fields, entry_data.get("sheet_headers"))
         await query.edit_message_text(
             f"Что исправить? Напиши поправку, например:\n"
             f"<i>Каспи 200к, кассир Асель</i>\n\n"
@@ -1107,7 +1108,7 @@ async def _handle_callback_inner(query, data: str, cfg: "ConfigManager",
     await query.edit_message_text(
         f"Записал в строку {row_num} → *{sheet_name}*. ✅\n\n"
         f"{format_preview(parsed, cfg.fields, sheet_headers)}",
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
     )
 
 

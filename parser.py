@@ -157,16 +157,16 @@ def format_preview(parsed: dict[str, Any], fields: list[dict],
                 continue
             if f["type"] == "text" and not str(val).strip():
                 continue
-        lines.append(f"*{f['label']}:* {val}")
+        lines.append(f"<b>{f['label']}:</b> {val}")
 
     extra = parsed.get("extra_expenses", [])
     if extra:
-        lines.append("\n*Доп. расходы:*")
+        lines.append("\n<b>Доп. расходы:</b>")
         for item in extra:
             amount_str = f"{item['amount']:,}".replace(",", " ")
             lines.append(f"  • {item['name']}: {amount_str}")
 
-    return "\n".join(lines) or "_(данные не распознаны)_"
+    return "\n".join(lines) or "<i>(данные не распознаны)</i>"
 
 
 class ExpenseParser:
