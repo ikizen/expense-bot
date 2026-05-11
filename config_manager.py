@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 CONFIG_SHEET = "_config"
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "version": 2,
+    "version": 3,
     "fields": [
         # ── Обязательные ──────────────────────────────────────────────────
         {"key": "date",                 "label": "Дата",                        "type": "date"},
@@ -80,9 +80,27 @@ class ConfigManager:
                 ws = sh.worksheet(CONFIG_SHEET)
                 raw = ws.acell("A1").value
                 if raw:
-                    self._cfg = json.loads(raw)
+                    loaded = json.loads(raw)
+                    loaded_ver = loaded.get("version", 1)
+                    need_ver   = DEFAULT_CONFIG["version"]
+                    if loaded_ver < need_ver:
+                        log.info(
+                            "Конфиг устарел (v%s < v%s) — автообновляю до актуального",
+                            loaded_ver, need_ver,
+                        )
+                        # Сохраняем пользовательские триггеры/маршруты/алиасы
+                        self._cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+                        self._cfg["triggers"] = loaded.get("triggers", DEFAULT_CONFIG["triggers"])
+                        self._cfg["routes"]   = loaded.get("routes", {})
+                        self._cfg["aliases"]  = loaded.get("aliases", {})
+                    else:
+                        self._cfg = loaded
                     self._trigger_pattern_cache = None
-                    log.info("Конфиг загружен из Google Sheets")
+                    try:
+                        self.save()
+                    except Exception as e:
+                        log.warning("Не удалось сохранить обновлённый конфиг: %s", e)
+                    log.info("Конфиг загружен (v%s)", self._cfg.get("version"))
                     return
             except gspread.WorksheetNotFound:
                 pass
@@ -91,7 +109,6 @@ class ConfigManager:
 
         # Первый запуск — используем дефолт
         self._cfg = json.loads(json.dumps(DEFAULT_CONFIG))
-        # Сохраняем best-effort: если не получится — работаем с дефолтом в памяти
         try:
             self.save()
         except Exception as e:
